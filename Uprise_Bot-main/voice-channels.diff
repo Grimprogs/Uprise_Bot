@@ -1,0 +1,1958 @@
+--- a/prisma/schema.prisma
++++ b/prisma/schema.prisma
+@@ -92,3 +92,40 @@
+   updatedAt DateTime @updatedAt
+ }
+ 
++
++// Member-owned temporary voice channels ("Join-to-Create" hub or /vc create).
++// Deleted automatically once the last human leaves.
++model DynamicVoiceChannel {
++  id        String   @id @default(cuid())
++  guildId   String
++  channelId String   @unique
++  ownerId   String
++  createdAt DateTime @default(now())
++
++  // A member can own at most one dynamic channel per guild (also blocks double-create races)
++  @@unique([guildId, ownerId])
++}
++
++// Event voice channels that are created locked and unlock automatically at startTime.
++model ScheduledEventChannel {
++  id                String    @id @default(cuid())
++  guildId           String
++  channelId         String    @unique
++  name              String
++  startTime         DateTime
++  endTime           DateTime? // null = event ends once the channel empties after opening
++  status            String    @default("PENDING") // PENDING, ACTIVE, ENDED, CANCELLED
++  creatorId         String
++  userLimit         Int       @default(0)
++  hidden            Boolean   @default(false)
++  announceChannelId String?
++  pingRoleId        String?
++  openedAt          DateTime?
++  endedAt           DateTime?
++  channelDeletedAt  DateTime? // set once the Discord channel is gone, so sweeps can skip the row
++  createdAt         DateTime  @default(now())
++  updatedAt         DateTime  @updatedAt
++
++  @@index([status, startTime])
++  @@index([status, endTime])
++}
+--- a/src/config/config.ts
++++ b/src/config/config.ts
+@@ -11,6 +11,12 @@
+   newMemberRoleId: string;
+   communityMemberRoleId: string;
+   botLogChannelId: string;
++  // Voice channel management
++  vcHubChannelId: string;
++  vcCategoryId: string;
++  eventVcCategoryId: string;
++  eventAnnounceChannelId: string;
++  eventManagerRoleId: string;
+   port: number;
+ }
+ 
+@@ -25,6 +31,11 @@
+   newMemberRoleId: process.env.NEW_MEMBER_ROLE_ID?.trim() || '',
+   communityMemberRoleId: process.env.COMMUNITY_MEMBER_ROLE_ID?.trim() || '',
+   botLogChannelId: process.env.BOT_LOG_CHANNEL_ID?.trim() || '',
++  vcHubChannelId: process.env.VC_HUB_CHANNEL_ID?.trim() || '',
++  vcCategoryId: process.env.VC_CATEGORY_ID?.trim() || '',
++  eventVcCategoryId: process.env.EVENT_VC_CATEGORY_ID?.trim() || '',
++  eventAnnounceChannelId: process.env.EVENT_ANNOUNCE_CHANNEL_ID?.trim() || '',
++  eventManagerRoleId: process.env.EVENT_MANAGER_ROLE_ID?.trim() || '',
+   port: parseInt(process.env.PORT || '3000', 10) || 3000,
+ };
+ 
+--- a/.env.example
++++ b/.env.example
+@@ -15,6 +15,19 @@
+ COMMUNITY_MEMBER_ROLE_ID=""
+ BOT_LOG_CHANNEL_ID=""
+ 
++# Dynamic Voice Channels
++# "➕ Create VC" hub: joining it creates a private channel for the member
++VC_HUB_CHANNEL_ID=""
++# Category for created channels (defaults to the hub's category)
++VC_CATEGORY_ID=""
++
++# Scheduled Event Voice Channels
++EVENT_VC_CATEGORY_ID=""
++# Where "event is now open" alerts are posted (overridable per event)
++EVENT_ANNOUNCE_CHANNEL_ID=""
++# Role allowed to use /event-vc in addition to members with Manage Events
++EVENT_MANAGER_ROLE_ID=""
++
+ # Port Configuration
+ PORT=3000
+ 
+--- a/src/utils/logger.ts
++++ b/src/utils/logger.ts
+@@ -6,7 +6,7 @@
+ export type LogLevel = 'info' | 'warn' | 'error' | 'success';
+ 
+ export interface LogEntry {
+-  type: 'JOIN' | 'LEAVE' | 'PENALTY' | 'INVITE_DETECTED' | 'VERIFICATION' | 'REFERRAL_CREATED' | 'REFERRAL_VALIDATED' | 'XP_AWARDED' | 'ERROR' | 'ADMIN';
++  type: 'JOIN' | 'LEAVE' | 'PENALTY' | 'INVITE_DETECTED' | 'VERIFICATION' | 'REFERRAL_CREATED' | 'REFERRAL_VALIDATED' | 'XP_AWARDED' | 'ERROR' | 'ADMIN' | 'VOICE';
+   title: string;
+   message: string;
+   metadata?: Record<string, unknown>;
+@@ -101,6 +101,8 @@
+         return 0xf97316; // Orange
+       case 'ADMIN':
+         return 0xa855f7; // Purple
++      case 'VOICE':
++        return 0x14b8a6; // Teal
+       default:
+         return 0x64748b; // Slate
+     }
+--- a/src/bot/client.ts
++++ b/src/bot/client.ts
+@@ -7,6 +7,10 @@
+ import guildMemberAddEvent from '../events/guildMemberAdd.ts';
+ import guildMemberRemoveEvent from '../events/guildMemberRemove.ts';
+ import interactionCreateEvent from '../events/interactionCreate.ts';
++import voiceStateUpdateEvent from '../events/voiceStateUpdate.ts';
++import VoiceChannelService from '../services/voiceChannelService.ts';
++import EventChannelService from '../services/eventChannelService.ts';
++import VoiceScheduler from '../services/voiceScheduler.ts';
+ 
+ import verifyCommand from '../commands/verify.ts';
+ import xpCommand from '../commands/xp.ts';
+@@ -14,6 +18,8 @@
+ import referralsCommand from '../commands/referrals.ts';
+ import adminXpCommand from '../commands/adminXp.ts';
+ import adminReferralCommand from '../commands/adminReferral.ts';
++import vcCommand from '../commands/vc.ts';
++import eventVcCommand from '../commands/eventVc.ts';
+ 
+ export const allCommands = [
+   verifyCommand,
+@@ -22,6 +28,8 @@
+   referralsCommand,
+   adminXpCommand,
+   adminReferralCommand,
++  vcCommand,
++  eventVcCommand,
+ ];
+ 
+ let botClient: Client | null = null;
+@@ -92,8 +100,15 @@
+         GatewayIntentBits.GuildMembers, // Privileged intent: must be enabled in Discord Dev Portal
+         GatewayIntentBits.GuildInvites, // Needed for tracking invites
+         GatewayIntentBits.GuildMessages,
++        GatewayIntentBits.GuildVoiceStates, // Join-to-Create hub + empty-channel cleanup
+       ],
+       partials: [Partials.GuildMember, Partials.User],
++      rest: {
++        // Channel renames are capped at 2 per 10 min. By default discord.js silently queues the
++        // request for up to 10 minutes; reject instead so /vc rename can tell the user when to retry.
++        rejectOnRateLimit: (data) =>
++          data.method === 'PATCH' && data.route === '/channels/:id' && Math.max(data.retryAfter, data.timeToReset) > 5000,
++      },
+     });
+ 
+     Logger.setDiscordClient(client);
+@@ -110,6 +125,15 @@
+     client.on(Events.GuildMemberAdd, (member) => guildMemberAddEvent.execute(member));
+     client.on(Events.GuildMemberRemove, (member) => guildMemberRemoveEvent.execute(member));
+     client.on(Events.InteractionCreate, (interaction) => interactionCreateEvent.execute(interaction));
++    client.on(Events.VoiceStateUpdate, (oldState, newState) => voiceStateUpdateEvent.execute(oldState, newState));
++    client.on(Events.ChannelDelete, async (channel) => {
++      try {
++        await VoiceChannelService.onChannelDeleted(channel.id);
++        await EventChannelService.onChannelDeleted(channel.id);
++      } catch (err: any) {
++        console.warn('[UPRISE Bot] channelDelete cleanup error:', err.message);
++      }
++    });
+ 
+     client.on('error', (err) => {
+       console.error('[UPRISE Bot] Discord client error:', err);
+@@ -154,6 +178,7 @@
+  * Gracefully stops the Discord bot
+  */
+ export async function stopDiscordBot(): Promise<void> {
++  VoiceScheduler.stop();
+   if (botClient) {
+     console.log('[UPRISE Bot] Destroying Discord client connection...');
+     await botClient.destroy();
+--- a/src/events/ready.ts
++++ b/src/events/ready.ts
+@@ -4,6 +4,7 @@
+ import { createVerificationButtonRow } from '../commands/verify.ts';
+ import Logger from '../utils/logger.ts';
+ import config from '../config/config.ts';
++import VoiceScheduler from '../services/voiceScheduler.ts';
+ 
+ export const readyEvent = {
+   name: Events.ClientReady,
+@@ -14,6 +15,10 @@
+     console.log(`[UPRISE Bot] Logged in as ${client.user.tag} (${client.user.id})`);
+     Logger.setDiscordClient(client);
+ 
++    // Started first so event channels open on time even if the guild setup below is slow or fails.
++    // Its first tick re-hydrates: opens/ends anything that came due while offline and re-arms timers.
++    VoiceScheduler.start(client);
++
+     try {
+       // Fetch all guilds actively
+       const oauthGuilds = await client.guilds.fetch().catch(() => null);
+--- a/src/events/interactionCreate.ts
++++ b/src/events/interactionCreate.ts
+@@ -11,6 +11,8 @@
+ import referralsCommand from '../commands/referrals.ts';
+ import adminXpCommand from '../commands/adminXp.ts';
+ import adminReferralCommand from '../commands/adminReferral.ts';
++import vcCommand, { VC_PANEL_PREFIX } from '../commands/vc.ts';
++import eventVcCommand from '../commands/eventVc.ts';
+ import ReferralService from '../services/referralService.ts';
+ import Logger from '../utils/logger.ts';
+ 
+@@ -46,6 +48,12 @@
+           case 'admin-referral':
+             await adminReferralCommand.execute(interaction);
+             break;
++          case 'vc':
++            await vcCommand.execute(interaction);
++            break;
++          case 'event-vc':
++            await eventVcCommand.execute(interaction);
++            break;
+           default:
+             console.warn(`[UPRISE Bot] Unknown command received: ${commandName}`);
+         }
+@@ -70,6 +78,17 @@
+           await leaderboardCommand.handlePagination(interaction);
+           return;
+         }
++
++        if (customId.startsWith(VC_PANEL_PREFIX)) {
++          await vcCommand.handleComponent(interaction);
++          return;
++        }
++      }
++
++      // 2b. Handle User Select Menus (voice channel control panel)
++      if (interaction.isUserSelectMenu() && interaction.customId.startsWith(VC_PANEL_PREFIX)) {
++        await vcCommand.handleComponent(interaction);
++        return;
+       }
+ 
+       // 3. Handle Modal Submissions
+@@ -85,6 +104,11 @@
+           await verifyCommand.handleOtpSubmit(interaction);
+           return;
+         }
++
++        if (customId.startsWith(VC_PANEL_PREFIX)) {
++          await vcCommand.handleComponent(interaction);
++          return;
++        }
+       }
+     } catch (err: any) {
+       console.error('[UPRISE Bot] Interaction error:', err);
+--- /dev/null
++++ b/src/utils/timeParser.ts
+@@ -0,0 +1,60 @@
++/**
++ * Parses flexible time input used by /event-vc:
++ *  - Durations relative to `base`:   "30m", "2h", "1h30m", "in 1 day", "90 minutes"
++ *  - Discord timestamps:             "<t:1767225600:F>"
++ *  - Unix timestamps (sec or ms):    "1767225600", "1767225600000"
++ *  - ISO 8601:                       "2026-10-05T18:00:00+05:30", "2026-10-05 18:00" (no offset = UTC)
++ */
++
++const UNIT_MS: Record<string, number> = {
++  s: 1000,
++  m: 60 * 1000,
++  h: 60 * 60 * 1000,
++  d: 24 * 60 * 60 * 1000,
++  w: 7 * 24 * 60 * 60 * 1000,
++};
++
++const DURATION_TOKEN = /(\d+)\s*(weeks?|w|days?|d|hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)/g;
++
++function parseDuration(input: string): number | null {
++  const text = input.replace(/^in\s+/, '');
++  let total = 0;
++  let matched = false;
++
++  const leftover = text.replace(DURATION_TOKEN, (_, amount: string, unit: string) => {
++    matched = true;
++    total += parseInt(amount, 10) * UNIT_MS[unit[0]];
++    return '';
++  });
++
++  // Reject partial matches like "2h tomorrow"
++  if (!matched || leftover.replace(/[\s,]|and/g, '') !== '') return null;
++  return total;
++}
++
++export function parseTimeInput(raw: string, base: Date = new Date()): Date | null {
++  const input = raw.trim().toLowerCase();
++  if (!input) return null;
++
++  const discordTs = /^<t:(\d+)(?::[a-z])?>$/.exec(input);
++  if (discordTs) return new Date(parseInt(discordTs[1], 10) * 1000);
++
++  if (/^\d{9,13}$/.test(input)) {
++    const n = parseInt(input, 10);
++    return new Date(input.length <= 10 ? n * 1000 : n);
++  }
++
++  const durationMs = parseDuration(input);
++  if (durationMs !== null) return new Date(base.getTime() + durationMs);
++
++  // ISO without an explicit offset would otherwise use the host's local timezone; pin it to UTC
++  let iso = raw.trim().replace(' ', 'T');
++  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?$/.test(iso)) iso += 'Z';
++  const parsed = Date.parse(iso);
++  return Number.isNaN(parsed) ? null : new Date(parsed);
++}
++
++/** Discord dynamic timestamp markdown, rendered in each viewer's local timezone. */
++export function discordTimestamp(date: Date, style: 'F' | 'R' | 'f' | 't' = 'F'): string {
++  return `<t:${Math.floor(date.getTime() / 1000)}:${style}>`;
++}
+--- /dev/null
++++ b/src/utils/voiceUtils.ts
+@@ -0,0 +1,149 @@
++import {
++  ChannelType,
++  DiscordAPIError,
++  OverwriteType,
++  PermissionFlagsBits,
++  PermissionsBitField,
++  RESTJSONErrorCodes,
++  type CategoryChannel,
++  type Guild,
++  type GuildMember,
++  type VoiceChannel,
++} from 'discord.js';
++
++export type AccessPerm = 'Connect' | 'ViewChannel';
++
++export interface RawOverwrite {
++  id: string;
++  type: OverwriteType;
++  allow: bigint;
++  deny: bigint;
++}
++
++export function isUnknownChannelError(err: unknown): boolean {
++  return err instanceof DiscordAPIError && err.code === RESTJSONErrorCodes.UnknownChannel;
++}
++
++/**
++ * Resolves a voice channel by ID.
++ * Returns null only when Discord confirms the channel no longer exists (or isn't voice);
++ * transient/permission errors are rethrown so callers never purge DB rows on a network blip.
++ */
++export async function fetchVoiceChannel(guild: Guild, channelId: string): Promise<VoiceChannel | null> {
++  let channel = guild.channels.cache.get(channelId) ?? null;
++  if (!channel) {
++    try {
++      channel = await guild.channels.fetch(channelId);
++    } catch (err) {
++      if (isUnknownChannelError(err)) return null;
++      throw err;
++    }
++  }
++  return channel?.type === ChannelType.GuildVoice ? channel : null;
++}
++
++export function humanCount(channel: VoiceChannel): number {
++  return channel.members.filter((m) => !m.user.bot).size;
++}
++
++/** Names of permissions the bot is missing in `channel` (empty array = all good). */
++export function missingBotPermissions(channel: VoiceChannel | CategoryChannel, perms: bigint[]): string[] {
++  const me = channel.guild.members.me;
++  if (!me) return ['(bot member not cached)'];
++  return channel.permissionsFor(me).missing(perms);
++}
++
++/**
++ * Category overwrites to copy onto a new child channel, masked to bits the bot itself holds:
++ * Discord rejects overwrite edits that touch permissions the bot doesn't have.
++ */
++export function inheritCategoryOverwrites(parent: CategoryChannel | null, me: GuildMember): RawOverwrite[] {
++  if (!parent) return [];
++  const botPerms = parent.permissionsFor(me);
++  const mask = botPerms.has(PermissionFlagsBits.Administrator) ? PermissionsBitField.All : botPerms.bitfield;
++  return parent.permissionOverwrites.cache.map((ow) => ({
++    id: ow.id,
++    type: ow.type,
++    allow: ow.allow.bitfield & mask,
++    deny: ow.deny.bitfield & mask,
++  }));
++}
++
++/**
++ * In-memory lock for channel creation: deny `bits` for @everyone and for any role overwrite that
++ * explicitly allows them. Denying only @everyone is not enough on servers where a role (e.g.
++ * @Community Member) is granted access at the category level — a role allow beats an @everyone deny.
++ */
++export function denyForRoles(overwrites: RawOverwrite[], everyoneId: string, bits: bigint): RawOverwrite[] {
++  const result = overwrites.map((ow) => {
++    if (ow.type !== OverwriteType.Role) return ow;
++    const toDeny = ow.id === everyoneId ? bits : ow.allow & bits;
++    return { ...ow, allow: ow.allow & ~toDeny, deny: ow.deny | toDeny };
++  });
++  if (!result.some((ow) => ow.id === everyoneId)) {
++    result.push({ id: everyoneId, type: OverwriteType.Role, allow: 0n, deny: bits });
++  }
++  return result;
++}
++
++export function isRoleLocked(channel: VoiceChannel, perm: AccessPerm): boolean {
++  const everyone = channel.permissionOverwrites.cache.get(channel.guild.roles.everyone.id);
++  return Boolean(everyone?.deny.has(PermissionFlagsBits[perm]));
++}
++
++/** What the parent category says for this overwrite target: true (allow), false (deny) or null (inherit). */
++function categoryState(channel: VoiceChannel, id: string, perm: AccessPerm): boolean | null {
++  const parentOw = channel.parent?.permissionOverwrites.cache.get(id);
++  if (parentOw?.allow.has(PermissionFlagsBits[perm])) return true;
++  if (parentOw?.deny.has(PermissionFlagsBits[perm])) return false;
++  return null;
++}
++
++/**
++ * Live lock/unlock of a permission for roles.
++ *  - lock:   deny for @everyone + every role overwrite that currently allows it
++ *  - unlock: restore every role overwrite to the parent category's value, so server-wide
++ *            gating (e.g. verified-only categories) is preserved instead of forced to "allow"
++ * Member overwrites (owner, permitted users, the bot) are untouched and keep winning.
++ */
++export async function setRoleAccess(channel: VoiceChannel, perm: AccessPerm, locked: boolean, reason: string) {
++  const bit = PermissionFlagsBits[perm];
++  const everyoneId = channel.guild.roles.everyone.id;
++  const roleOverwrites = channel.permissionOverwrites.cache.filter((ow) => ow.type === OverwriteType.Role);
++
++  if (locked) {
++    const targets = new Set<string>([everyoneId]);
++    for (const ow of roleOverwrites.values()) {
++      if (ow.allow.has(bit)) targets.add(ow.id);
++    }
++    for (const id of targets) {
++      if (channel.permissionOverwrites.cache.get(id)?.deny.has(bit)) continue; // already locked
++      await channel.permissionOverwrites.edit(id, { [perm]: false }, { type: OverwriteType.Role, reason });
++    }
++    return;
++  }
++
++  for (const ow of roleOverwrites.values()) {
++    const desired = categoryState(channel, ow.id, perm);
++    const current = ow.allow.has(bit) ? true : ow.deny.has(bit) ? false : null;
++    if (desired !== current) {
++      await channel.permissionOverwrites.edit(ow.id, { [perm]: desired }, { type: OverwriteType.Role, reason });
++    }
++  }
++}
++
++/** Deletes a channel if the bot is allowed to. Returns true when the channel is gone. */
++export async function safeDeleteChannel(channel: VoiceChannel, reason: string): Promise<boolean> {
++  if (!channel.deletable) {
++    console.warn(`[Voice] Cannot delete #${channel.name} (${channel.id}): bot lacks Manage Channels.`);
++    return false;
++  }
++  try {
++    await channel.delete(reason);
++    return true;
++  } catch (err: any) {
++    if (isUnknownChannelError(err)) return true;
++    console.warn(`[Voice] Failed to delete #${channel.name} (${channel.id}):`, err.message);
++    return false;
++  }
++}
+--- /dev/null
++++ b/src/services/voiceChannelService.ts
+@@ -0,0 +1,426 @@
++import {
++  ChannelType,
++  OverwriteType,
++  PermissionFlagsBits,
++  PermissionsBitField,
++  RateLimitError,
++  type CategoryChannel,
++  type Client,
++  type Guild,
++  type GuildMember,
++  type PermissionsString,
++  type VoiceChannel,
++} from 'discord.js';
++import { Prisma } from '@prisma/client';
++import prisma from '../database/prisma.ts';
++import config from '../config/config.ts';
++import Logger from '../utils/logger.ts';
++import {
++  fetchVoiceChannel,
++  humanCount,
++  inheritCategoryOverwrites,
++  isRoleLocked,
++  missingBotPermissions,
++  safeDeleteChannel,
++  setRoleAccess,
++  type AccessPerm,
++} from '../utils/voiceUtils.ts';
++
++/** User-facing failure: the message is safe to show directly in Discord. */
++// No constructor parameter properties: `npm start` runs server.ts via Node's native type
++// stripping, which rejects them (ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX)
++export class VoiceActionError extends Error {
++  public readonly channel?: VoiceChannel;
++
++  constructor(message: string, channel?: VoiceChannel) {
++    super(message);
++    this.channel = channel;
++  }
++}
++
++const OWNER_MANAGE_PERMS = {
++  ManageChannels: true,
++  MoveMembers: true,
++  MuteMembers: true,
++  DeafenMembers: true,
++} as const;
++
++const OWNER_PERMS = {
++  ViewChannel: true,
++  Connect: true,
++  Speak: true,
++  Stream: true,
++  ...OWNER_MANAGE_PERMS,
++} as const;
++
++const BOT_PERMS = {
++  ViewChannel: true,
++  Connect: true,
++  ManageChannels: true,
++  MoveMembers: true,
++} as const;
++
++const OWNER_ALLOW = Object.keys(OWNER_PERMS) as PermissionsString[];
++const BOT_ALLOW = Object.keys(BOT_PERMS) as PermissionsString[];
++
++// The bot can only grant permissions it holds itself, plus Manage Roles to write overwrites
++const BOT_REQUIRED_TO_CREATE = new PermissionsBitField([...OWNER_ALLOW, ...BOT_ALLOW, 'ManageRoles']);
++const BOT_REQUIRED_TO_EDIT = [PermissionFlagsBits.ManageChannels, PermissionFlagsBits.ManageRoles];
++
++// Channels created via /vc create while the owner isn't in voice get this long to be joined
++const EMPTY_GRACE_MS = 2 * 60 * 1000;
++const HUB_COOLDOWN_MS = 10 * 1000;
++
++// Discord allows 2 name changes per channel per 10 minutes
++const RENAME_WINDOW_MS = 10 * 60 * 1000;
++const RENAME_MAX = 2;
++const renameHistory = new Map<string, number[]>();
++
++const hubCooldowns = new Map<string, number>();
++const creatingFor = new Set<string>();
++
++function recentRenames(channelId: string): number[] {
++  const cutoff = Date.now() - RENAME_WINDOW_MS;
++  const history = (renameHistory.get(channelId) || []).filter((t) => t > cutoff);
++  if (history.length) renameHistory.set(channelId, history);
++  else renameHistory.delete(channelId);
++  return history;
++}
++
++function sanitizeName(raw: string): string {
++  return raw.replace(/\s+/g, ' ').trim().slice(0, 100);
++}
++
++function assertBotCanEdit(channel: VoiceChannel, extra: bigint[] = []) {
++  const missing = missingBotPermissions(channel, [...BOT_REQUIRED_TO_EDIT, ...extra]);
++  if (missing.length) {
++    throw new VoiceActionError(`I'm missing permissions in this channel: ${missing.join(', ')}.`, channel);
++  }
++}
++
++export class VoiceChannelService {
++  /** Rename budget for the panel display. */
++  public static renameStatus(channelId: string): { remaining: number; nextAt: Date | null } {
++    const history = recentRenames(channelId);
++    return {
++      remaining: Math.max(0, RENAME_MAX - history.length),
++      nextAt: history.length >= RENAME_MAX ? new Date(history[0] + RENAME_WINDOW_MS) : null,
++    };
++  }
++
++  public static async isDynamicChannel(channelId: string): Promise<boolean> {
++    return Boolean(await prisma.dynamicVoiceChannel.findUnique({ where: { channelId } }));
++  }
++
++  /** The member's live dynamic channel, purging the DB row if Discord says the channel is gone. */
++  public static async getOwnedChannel(guild: Guild, ownerId: string): Promise<VoiceChannel | null> {
++    const record = await prisma.dynamicVoiceChannel.findUnique({
++      where: { guildId_ownerId: { guildId: guild.id, ownerId } },
++    });
++    if (!record) return null;
++
++    const channel = await fetchVoiceChannel(guild, record.channelId);
++    if (!channel) {
++      await prisma.dynamicVoiceChannel.deleteMany({ where: { channelId: record.channelId } });
++      return null;
++    }
++    return channel;
++  }
++
++  public static async requireOwnedChannel(guild: Guild, ownerId: string): Promise<VoiceChannel> {
++    const channel = await this.getOwnedChannel(guild, ownerId);
++    if (!channel) {
++      throw new VoiceActionError(
++        "You don't own a custom voice channel. Join the **➕ Create VC** channel or use `/vc create`."
++      );
++    }
++    return channel;
++  }
++
++  public static resolveCategory(guild: Guild): CategoryChannel | null {
++    const id = config.vcCategoryId || guild.channels.cache.get(config.vcHubChannelId)?.parentId;
++    const category = id ? guild.channels.cache.get(id) : null;
++    return category?.type === ChannelType.GuildCategory ? category : null;
++  }
++
++  public static async createChannel(params: {
++    guild: Guild;
++    owner: GuildMember;
++    name?: string | null;
++    userLimit?: number | null;
++  }): Promise<VoiceChannel> {
++    const { guild, owner } = params;
++    const me = guild.members.me;
++    if (!me) throw new VoiceActionError('Bot member is not available yet, please try again.');
++
++    const existing = await this.getOwnedChannel(guild, owner.id);
++    if (existing) {
++      throw new VoiceActionError(`You already own ${existing}. Use \`/vc menu\` to manage it.`, existing);
++    }
++
++    const parent = this.resolveCategory(guild);
++    const scopePerms = parent ? parent.permissionsFor(me) : me.permissions;
++    const missing = scopePerms.missing(BOT_REQUIRED_TO_CREATE);
++    if (missing.length) {
++      throw new VoiceActionError(`I can't create voice channels here. Missing permissions: ${missing.join(', ')}.`);
++    }
++
++    const name = sanitizeName(params.name || '') || sanitizeName(`${owner.displayName}'s Lounge`);
++    const inherited = inheritCategoryOverwrites(parent, me).filter((ow) => ow.id !== owner.id && ow.id !== me.id);
++
++    const channel = await guild.channels.create({
++      name,
++      type: ChannelType.GuildVoice,
++      parent: parent?.id,
++      userLimit: Math.min(Math.max(params.userLimit ?? 0, 0), 99),
++      reason: `Custom voice channel for ${owner.user.tag}`,
++      permissionOverwrites: [
++        ...inherited,
++        { id: owner.id, type: OverwriteType.Member, allow: OWNER_ALLOW },
++        { id: me.id, type: OverwriteType.Member, allow: BOT_ALLOW },
++      ],
++    });
++
++    try {
++      await prisma.dynamicVoiceChannel.create({
++        data: { guildId: guild.id, channelId: channel.id, ownerId: owner.id },
++      });
++    } catch (err) {
++      // Lost a race with a concurrent create (unique guildId+ownerId): don't leave an orphan behind
++      await safeDeleteChannel(channel, 'Duplicate custom voice channel');
++      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
++        throw new VoiceActionError('You already have a custom voice channel being created.');
++      }
++      throw err;
++    }
++
++    await Logger.log({
++      type: 'VOICE',
++      title: 'Custom Voice Channel Created',
++      message: `@${owner.user.username} created **${channel.name}**.`,
++      metadata: { channelId: channel.id, ownerId: owner.id },
++    });
++
++    return channel;
++  }
++
++  /** "➕ Create VC" hub: create (or reuse) the member's channel and move them into it. */
++  public static async handleHubJoin(member: GuildMember) {
++    if (member.user.bot || creatingFor.has(member.id)) return;
++    creatingFor.add(member.id);
++
++    try {
++      const existing = await this.getOwnedChannel(member.guild, member.id);
++      if (existing) {
++        await member.voice.setChannel(existing, 'Returning owner to their channel').catch(() => {});
++        return;
++      }
++
++      const now = Date.now();
++      for (const [id, at] of hubCooldowns) {
++        if (now - at > HUB_COOLDOWN_MS) hubCooldowns.delete(id);
++      }
++      if (hubCooldowns.has(member.id)) {
++        // Rapid join/leave spam: bounce them out of the hub instead of creating another channel
++        await member.voice.disconnect('Join-to-Create cooldown').catch(() => {});
++        return;
++      }
++      hubCooldowns.set(member.id, now);
++
++      const channel = await this.createChannel({ guild: member.guild, owner: member });
++      try {
++        await member.voice.setChannel(channel, 'Join-to-Create');
++      } catch {
++        // They left voice before the move completed
++        await this.deleteIfEmpty(channel);
++      }
++    } catch (err: any) {
++      await Logger.log({
++        type: 'ERROR',
++        title: 'Join-to-Create Failed',
++        message: `Could not create a voice channel for @${member.user.username}: ${err.message}`,
++      });
++      await member.voice.disconnect('Join-to-Create failed').catch(() => {});
++    } finally {
++      creatingFor.delete(member.id);
++    }
++  }
++
++  /** Called on every voice leave: removes a dynamic channel once no humans remain. */
++  public static async handleChannelLeft(channel: VoiceChannel) {
++    if (humanCount(channel) > 0) return;
++    if (!(await this.isDynamicChannel(channel.id))) return;
++    await this.deleteIfEmpty(channel);
++  }
++
++  public static async deleteIfEmpty(channel: VoiceChannel): Promise<boolean> {
++    if (humanCount(channel) > 0) return false;
++    const deleted = await safeDeleteChannel(channel, 'Custom voice channel is empty');
++    if (deleted) {
++      await prisma.dynamicVoiceChannel.deleteMany({ where: { channelId: channel.id } });
++    }
++    return deleted;
++  }
++
++  public static async onChannelDeleted(channelId: string) {
++    renameHistory.delete(channelId);
++    await prisma.dynamicVoiceChannel.deleteMany({ where: { channelId } });
++  }
++
++  /**
++   * Reconciles DB with Discord: drops rows for channels deleted while the bot was offline and
++   * removes channels that emptied during downtime or were never joined after /vc create.
++   */
++  public static async sweep(client: Client) {
++    const records = await prisma.dynamicVoiceChannel.findMany();
++    for (const record of records) {
++      const guild = client.guilds.cache.get(record.guildId);
++      if (!guild) continue;
++
++      let channel: VoiceChannel | null;
++      try {
++        channel = await fetchVoiceChannel(guild, record.channelId);
++      } catch {
++        continue; // transient — try again next sweep
++      }
++
++      if (!channel) {
++        await prisma.dynamicVoiceChannel.deleteMany({ where: { channelId: record.channelId } });
++      } else if (Date.now() - record.createdAt.getTime() > EMPTY_GRACE_MS) {
++        await this.deleteIfEmpty(channel);
++      }
++    }
++  }
++
++  // ───────────────────────────── Owner actions ─────────────────────────────
++
++  public static async setAccess(channel: VoiceChannel, perm: AccessPerm, locked: boolean): Promise<string> {
++    const label = perm === 'Connect' ? (locked ? 'locked' : 'unlocked') : locked ? 'hidden' : 'visible';
++    if (isRoleLocked(channel, perm) === locked) {
++      return `${channel} is already ${label}.`;
++    }
++    assertBotCanEdit(channel);
++
++    if (locked) {
++      // Let people already inside rejoin if they drop
++      for (const member of channel.members.values()) {
++        if (member.user.bot) continue;
++        const ow = channel.permissionOverwrites.cache.get(member.id);
++        if (!ow?.allow.has(PermissionFlagsBits[perm])) {
++          await channel.permissionOverwrites.edit(member.id, { ViewChannel: true, Connect: true }, { type: OverwriteType.Member });
++        }
++      }
++    }
++
++    await setRoleAccess(channel, perm, locked, `Custom VC ${label} by owner`);
++    return `${channel} is now **${label}**.`;
++  }
++
++  public static async rename(channel: VoiceChannel, rawName: string): Promise<string> {
++    const name = sanitizeName(rawName);
++    if (!name) throw new VoiceActionError('Channel name cannot be empty.', channel);
++    if (name === channel.name) return `${channel} is already named **${name}**.`;
++    assertBotCanEdit(channel);
++
++    const { nextAt } = this.renameStatus(channel.id);
++    if (nextAt) {
++      throw new VoiceActionError(
++        `Discord only allows 2 renames per 10 minutes. You can rename again <t:${Math.ceil(nextAt.getTime() / 1000)}:R>.`,
++        channel
++      );
++    }
++
++    try {
++      // The client is configured to reject (not silently queue) long channel-edit rate limits
++      await channel.setName(name, 'Custom VC renamed by owner');
++    } catch (err) {
++      if (err instanceof RateLimitError) {
++        const retryAt = Math.ceil((Date.now() + err.retryAfter) / 1000);
++        throw new VoiceActionError(`Discord's rename limit was hit. Try again <t:${retryAt}:R>.`, channel);
++      }
++      throw err;
++    }
++
++    renameHistory.set(channel.id, [...recentRenames(channel.id), Date.now()]);
++    return `Channel renamed to **${name}**.`;
++  }
++
++  public static async setLimit(channel: VoiceChannel, limit: number): Promise<string> {
++    if (!Number.isInteger(limit) || limit < 0 || limit > 99) {
++      throw new VoiceActionError('User limit must be a whole number between 0 and 99 (0 = unlimited).', channel);
++    }
++    assertBotCanEdit(channel);
++    await channel.setUserLimit(limit, 'Custom VC limit changed by owner');
++    return limit === 0 ? 'User limit removed (unlimited).' : `User limit set to **${limit}**.`;
++  }
++
++  public static async permit(channel: VoiceChannel, target: GuildMember): Promise<string> {
++    assertBotCanEdit(channel);
++    await channel.permissionOverwrites.edit(
++      target.id,
++      { ViewChannel: true, Connect: true },
++      { type: OverwriteType.Member, reason: 'Permitted by custom VC owner' }
++    );
++    return `${target} can now see and join ${channel}.`;
++  }
++
++  public static async reject(channel: VoiceChannel, target: GuildMember, ownerId: string): Promise<string> {
++    if (target.id === ownerId) throw new VoiceActionError("You can't kick yourself.", channel);
++    if (target.id === channel.client.user.id) throw new VoiceActionError("I can't kick myself.", channel);
++    if (target.permissions.any([PermissionFlagsBits.Administrator, PermissionFlagsBits.ManageChannels])) {
++      throw new VoiceActionError(`${target} is server staff and can't be kicked from custom channels.`, channel);
++    }
++    assertBotCanEdit(channel, [PermissionFlagsBits.MoveMembers]);
++
++    await channel.permissionOverwrites.edit(
++      target.id,
++      { Connect: false, ViewChannel: null },
++      { type: OverwriteType.Member, reason: 'Rejected by custom VC owner' }
++    );
++
++    const wasInside = target.voice.channelId === channel.id;
++    if (wasInside) {
++      await target.voice.disconnect('Kicked by custom VC owner');
++    }
++    return `${target} ${wasInside ? 'was disconnected and ' : ''}can no longer join ${channel}.`;
++  }
++
++  public static async transfer(channel: VoiceChannel, fromId: string, target: GuildMember): Promise<string> {
++    if (target.user.bot) throw new VoiceActionError("Ownership can't be transferred to a bot.", channel);
++    if (target.id === fromId) throw new VoiceActionError('You already own this channel.', channel);
++    assertBotCanEdit(channel);
++
++    if (await this.getOwnedChannel(channel.guild, target.id)) {
++      throw new VoiceActionError(`${target} already owns a custom voice channel.`, channel);
++    }
++
++    try {
++      await prisma.dynamicVoiceChannel.update({ where: { channelId: channel.id }, data: { ownerId: target.id } });
++    } catch (err) {
++      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
++        throw new VoiceActionError(`${target} already owns a custom voice channel.`, channel);
++      }
++      throw err;
++    }
++
++    await channel.permissionOverwrites.edit(target.id, OWNER_PERMS, {
++      type: OverwriteType.Member,
++      reason: 'Custom VC ownership transferred',
++    });
++    // Previous owner keeps access as a regular member but loses management rights
++    await channel.permissionOverwrites.edit(
++      fromId,
++      { ManageChannels: null, MoveMembers: null, MuteMembers: null, DeafenMembers: null },
++      { type: OverwriteType.Member, reason: 'Custom VC ownership transferred' }
++    );
++
++    await Logger.log({
++      type: 'VOICE',
++      title: 'Custom Voice Channel Transferred',
++      message: `**${channel.name}** ownership moved from <@${fromId}> to @${target.user.username}.`,
++    });
++    return `Ownership of ${channel} transferred to ${target}.`;
++  }
++}
++
++export default VoiceChannelService;
+--- /dev/null
++++ b/src/services/eventChannelService.ts
+@@ -0,0 +1,427 @@
++import {
++  ChannelType,
++  EmbedBuilder,
++  OverwriteType,
++  PermissionFlagsBits,
++  type CategoryChannel,
++  type Client,
++  type Guild,
++  type GuildMember,
++  type VoiceChannel,
++} from 'discord.js';
++import type { ScheduledEventChannel } from '@prisma/client';
++import prisma from '../database/prisma.ts';
++import config from '../config/config.ts';
++import Logger from '../utils/logger.ts';
++import { discordTimestamp } from '../utils/timeParser.ts';
++import {
++  denyForRoles,
++  fetchVoiceChannel,
++  humanCount,
++  inheritCategoryOverwrites,
++  safeDeleteChannel,
++  setRoleAccess,
++} from '../utils/voiceUtils.ts';
++
++export type EventStatus = 'PENDING' | 'ACTIVE' | 'ENDED' | 'CANCELLED';
++
++// Events due before the next poll get an exact setTimeout so they open on the second
++const PRECISE_TIMER_HORIZON_MS = 35 * 1000;
++// Open-ended events (no end_time) that nobody joins are closed after this long
++const OPEN_ENDED_IDLE_MS = 60 * 60 * 1000;
++
++const BOT_REQUIRED = [
++  PermissionFlagsBits.ManageChannels,
++  PermissionFlagsBits.ManageRoles,
++  PermissionFlagsBits.ViewChannel,
++  PermissionFlagsBits.Connect,
++  PermissionFlagsBits.MoveMembers,
++];
++
++export class EventChannelService {
++  private static timers = new Map<string, NodeJS.Timeout>();
++
++  public static canManageEvents(member: GuildMember): boolean {
++    return (
++      member.permissions.any([PermissionFlagsBits.ManageEvents, PermissionFlagsBits.ManageGuild]) ||
++      Boolean(config.eventManagerRoleId && member.roles.cache.has(config.eventManagerRoleId))
++    );
++  }
++
++  public static resolveCategory(guild: Guild): CategoryChannel | null {
++    const category = config.eventVcCategoryId ? guild.channels.cache.get(config.eventVcCategoryId) : null;
++    return category?.type === ChannelType.GuildCategory ? category : null;
++  }
++
++  public static async createEvent(params: {
++    guild: Guild;
++    creator: GuildMember;
++    name: string;
++    startTime: Date;
++    endTime: Date | null;
++    userLimit: number;
++    hidden: boolean;
++    announceChannelId: string | null;
++    pingRoleId: string | null;
++  }): Promise<{ record: ScheduledEventChannel; channel: VoiceChannel }> {
++    const { guild, creator } = params;
++    const me = guild.members.me;
++    if (!me) throw new Error('Bot member is not available yet, please try again.');
++
++    const parent = this.resolveCategory(guild);
++    const missing = (parent ? parent.permissionsFor(me) : me.permissions).missing(BOT_REQUIRED);
++    if (missing.length) {
++      throw new Error(`I can't create event channels here. Missing permissions: ${missing.join(', ')}.`);
++    }
++
++    // Built locked in one API call so nobody can slip in between "create" and "lock"
++    const lockBits = PermissionFlagsBits.Connect | (params.hidden ? PermissionFlagsBits.ViewChannel : 0n);
++    const overwrites = denyForRoles(
++      inheritCategoryOverwrites(parent, me).filter((ow) => ow.id !== me.id && ow.id !== creator.id),
++      guild.roles.everyone.id,
++      lockBits
++    );
++
++    const channel = await guild.channels.create({
++      name: params.name,
++      type: ChannelType.GuildVoice,
++      parent: parent?.id,
++      userLimit: params.userLimit,
++      reason: `Scheduled event voice channel by ${creator.user.tag}`,
++      permissionOverwrites: [
++        ...overwrites,
++        // The host gets early access to set up before doors open
++        { id: creator.id, type: OverwriteType.Member, allow: ['ViewChannel', 'Connect'] },
++        { id: me.id, type: OverwriteType.Member, allow: ['ViewChannel', 'Connect', 'ManageChannels', 'MoveMembers'] },
++      ],
++    });
++
++    let record: ScheduledEventChannel;
++    try {
++      record = await prisma.scheduledEventChannel.create({
++        data: {
++          guildId: guild.id,
++          channelId: channel.id,
++          name: params.name,
++          startTime: params.startTime,
++          endTime: params.endTime,
++          creatorId: creator.id,
++          userLimit: params.userLimit,
++          hidden: params.hidden,
++          announceChannelId: params.announceChannelId,
++          pingRoleId: params.pingRoleId,
++        },
++      });
++    } catch (err) {
++      await safeDeleteChannel(channel, 'Failed to save scheduled event');
++      throw err;
++    }
++
++    await Logger.log({
++      type: 'VOICE',
++      title: 'Event Voice Channel Scheduled',
++      message: `@${creator.user.username} scheduled **${params.name}** for ${discordTimestamp(params.startTime)}.`,
++      metadata: { channelId: channel.id, eventId: record.id },
++    });
++
++    if (params.startTime.getTime() <= Date.now()) {
++      await this.openEvent(guild.client, record.id);
++    } else {
++      this.scheduleTimers(guild.client, record);
++    }
++
++    return { record: (await prisma.scheduledEventChannel.findUnique({ where: { id: record.id } })) ?? record, channel };
++  }
++
++  /** PENDING → ACTIVE: unlock the channel and announce. Idempotent and safe to call from timers + polls. */
++  public static async openEvent(client: Client, id: string) {
++    const record = await prisma.scheduledEventChannel.findUnique({ where: { id } });
++    if (!record || record.status !== 'PENDING') return;
++
++    // Bot was offline for the whole event window: close it without a misleading "now live" ping
++    if (record.endTime && record.endTime.getTime() <= Date.now()) {
++      await this.endEvent(client, id, 'Event window passed while the bot was offline');
++      return;
++    }
++
++    const guild = client.guilds.cache.get(record.guildId);
++    if (!guild) return; // retry on next poll
++
++    let channel: VoiceChannel | null;
++    try {
++      channel = await fetchVoiceChannel(guild, record.channelId);
++    } catch {
++      return; // transient — retry on next poll
++    }
++    if (!channel) {
++      await prisma.scheduledEventChannel.update({
++        where: { id },
++        data: { status: 'CANCELLED', channelDeletedAt: new Date() },
++      });
++      return;
++    }
++
++    // Atomic claim so a timer and a poll racing each other only open once
++    const claimed = await prisma.scheduledEventChannel.updateMany({
++      where: { id, status: 'PENDING' },
++      data: { status: 'ACTIVE', openedAt: new Date() },
++    });
++    if (claimed.count === 0) return;
++
++    try {
++      await setRoleAccess(channel, 'Connect', false, `Event "${record.name}" is starting`);
++      if (record.hidden) {
++        await setRoleAccess(channel, 'ViewChannel', false, `Event "${record.name}" is starting`);
++      }
++    } catch (err: any) {
++      await Logger.log({
++        type: 'ERROR',
++        title: 'Event Voice Channel Unlock Failed',
++        message: `**${record.name}** is due but ${channel} could not be unlocked: ${err.message}`,
++      });
++      return;
++    }
++
++    await this.announce(guild, record, channel);
++    await Logger.log({
++      type: 'VOICE',
++      title: 'Event Voice Channel Opened',
++      message: `**${record.name}** is now open in ${channel}.`,
++      metadata: { eventId: id },
++    });
++
++    if (record.endTime) this.scheduleTimers(client, { ...record, status: 'ACTIVE' });
++  }
++
++  /** PENDING/ACTIVE → ENDED: lock the channel, deleting it now if empty or once the last member leaves. */
++  public static async endEvent(client: Client, id: string, reason: string) {
++    const claimed = await prisma.scheduledEventChannel.updateMany({
++      where: { id, status: { in: ['PENDING', 'ACTIVE'] } },
++      data: { status: 'ENDED', endedAt: new Date() },
++    });
++    if (claimed.count === 0) return;
++
++    const record = await prisma.scheduledEventChannel.findUnique({ where: { id } });
++    if (!record) return;
++    this.clearTimersFor(id);
++
++    await Logger.log({
++      type: 'VOICE',
++      title: 'Event Voice Channel Ended',
++      message: `**${record.name}** has ended (${reason}).`,
++      metadata: { eventId: id },
++    });
++
++    const guild = client.guilds.cache.get(record.guildId);
++    if (!guild) return; // the ENDED sweep will finish cleanup later
++    await this.closeEndedChannel(guild, record);
++  }
++
++  public static async cancelEvent(client: Client, record: ScheduledEventChannel, cancelledBy: string) {
++    await prisma.scheduledEventChannel.update({ where: { id: record.id }, data: { status: 'CANCELLED', endedAt: new Date() } });
++    this.clearTimersFor(record.id);
++
++    const guild = client.guilds.cache.get(record.guildId);
++    const channel = guild ? await fetchVoiceChannel(guild, record.channelId).catch(() => undefined) : undefined;
++    if (channel === null || (channel && (await safeDeleteChannel(channel, `Event cancelled by ${cancelledBy}`)))) {
++      await prisma.scheduledEventChannel.update({ where: { id: record.id }, data: { channelDeletedAt: new Date() } });
++    }
++
++    await Logger.log({
++      type: 'VOICE',
++      title: 'Event Voice Channel Cancelled',
++      message: `**${record.name}** was cancelled by @${cancelledBy}.`,
++      metadata: { eventId: record.id },
++    });
++  }
++
++  /** Voice leave hook: finishes ENDED channels and ends open-ended events once everyone leaves. */
++  public static async handleChannelLeft(client: Client, channel: VoiceChannel) {
++    if (humanCount(channel) > 0) return;
++    const record = await prisma.scheduledEventChannel.findUnique({ where: { channelId: channel.id } });
++    if (!record) return;
++
++    if (record.status === 'ENDED' && !record.channelDeletedAt) {
++      await this.closeEndedChannel(channel.guild, record);
++    } else if (record.status === 'ACTIVE' && !record.endTime) {
++      await this.endEvent(client, record.id, 'everyone left');
++    }
++  }
++
++  public static async onChannelDeleted(channelId: string) {
++    const now = new Date();
++    await prisma.scheduledEventChannel.updateMany({
++      where: { channelId, status: { in: ['PENDING', 'ACTIVE'] } },
++      data: { status: 'CANCELLED', endedAt: now },
++    });
++    await prisma.scheduledEventChannel.updateMany({
++      where: { channelId, channelDeletedAt: null },
++      data: { channelDeletedAt: now },
++    });
++  }
++
++  /**
++   * Scheduler tick. All state lives in the DB, so this doubles as restart re-hydration:
++   * the first tick after boot opens/ends anything that came due while offline and re-arms timers.
++   */
++  public static async processDue(client: Client) {
++    const now = new Date();
++
++    const dueToOpen = await prisma.scheduledEventChannel.findMany({
++      where: { status: 'PENDING', startTime: { lte: now } },
++    });
++    for (const record of dueToOpen) {
++      await this.openEvent(client, record.id);
++    }
++
++    const dueToEnd = await prisma.scheduledEventChannel.findMany({
++      where: { status: { in: ['PENDING', 'ACTIVE'] }, endTime: { lte: now } },
++    });
++    for (const record of dueToEnd) {
++      await this.endEvent(client, record.id, 'scheduled end time reached');
++    }
++
++    const idleOpenEnded = await prisma.scheduledEventChannel.findMany({
++      where: { status: 'ACTIVE', endTime: null, openedAt: { lte: new Date(now.getTime() - OPEN_ENDED_IDLE_MS) } },
++    });
++    for (const record of idleOpenEnded) {
++      const guild = client.guilds.cache.get(record.guildId);
++      const channel = guild ? await fetchVoiceChannel(guild, record.channelId).catch(() => undefined) : undefined;
++      if (channel === null || (channel && humanCount(channel) === 0)) {
++        await this.endEvent(client, record.id, 'no one joined');
++      }
++    }
++
++    // Ended channels still waiting for their last member to leave (or missed during downtime)
++    const lingering = await prisma.scheduledEventChannel.findMany({
++      where: { status: 'ENDED', channelDeletedAt: null },
++    });
++    for (const record of lingering) {
++      const guild = client.guilds.cache.get(record.guildId);
++      if (guild) await this.closeEndedChannel(guild, record);
++    }
++
++    const horizon = new Date(now.getTime() + PRECISE_TIMER_HORIZON_MS);
++    const upcoming = await prisma.scheduledEventChannel.findMany({
++      where: {
++        OR: [
++          { status: 'PENDING', startTime: { gt: now, lte: horizon } },
++          { status: { in: ['PENDING', 'ACTIVE'] }, endTime: { gt: now, lte: horizon } },
++        ],
++      },
++    });
++    for (const record of upcoming) {
++      this.scheduleTimers(client, record);
++    }
++  }
++
++  public static async listOpen(guildId: string) {
++    return prisma.scheduledEventChannel.findMany({
++      where: { guildId, status: { in: ['PENDING', 'ACTIVE'] } },
++      orderBy: { startTime: 'asc' },
++      take: 15,
++    });
++  }
++
++  public static async findOpenByChannel(channelId: string) {
++    return prisma.scheduledEventChannel.findFirst({
++      where: { channelId, status: { in: ['PENDING', 'ACTIVE'] } },
++    });
++  }
++
++  public static clearTimers() {
++    for (const timer of this.timers.values()) clearTimeout(timer);
++    this.timers.clear();
++  }
++
++  // ───────────────────────────── internals ─────────────────────────────
++
++  private static async closeEndedChannel(guild: Guild, record: ScheduledEventChannel) {
++    let channel: VoiceChannel | null;
++    try {
++      channel = await fetchVoiceChannel(guild, record.channelId);
++    } catch {
++      return;
++    }
++
++    if (!channel) {
++      await prisma.scheduledEventChannel.update({ where: { id: record.id }, data: { channelDeletedAt: new Date() } });
++      return;
++    }
++
++    if (humanCount(channel) === 0) {
++      if (await safeDeleteChannel(channel, `Event "${record.name}" ended`)) {
++        await prisma.scheduledEventChannel.update({ where: { id: record.id }, data: { channelDeletedAt: new Date() } });
++      }
++      return;
++    }
++
++    // People are still talking: stop new joins and let the voice-leave hook delete it later
++    try {
++      await setRoleAccess(channel, 'Connect', true, `Event "${record.name}" ended`);
++    } catch (err: any) {
++      console.warn(`[EventChannelService] Could not lock ended event channel ${channel.id}:`, err.message);
++    }
++  }
++
++  private static async announce(guild: Guild, record: ScheduledEventChannel, channel: VoiceChannel) {
++    const targetId = record.announceChannelId || config.eventAnnounceChannelId;
++    if (!targetId) return;
++
++    const target = guild.channels.cache.get(targetId) ?? (await guild.channels.fetch(targetId).catch(() => null));
++    if (!target || !target.isTextBased()) {
++      console.warn(`[EventChannelService] Announcement channel ${targetId} not found or not text-based.`);
++      return;
++    }
++
++    const isEveryone = record.pingRoleId === guild.id;
++    const content = record.pingRoleId ? (isEveryone ? '@everyone' : `<@&${record.pingRoleId}>`) : undefined;
++
++    const embed = new EmbedBuilder()
++      .setTitle(`🔊 ${record.name} is live!`)
++      .setColor(0x14b8a6)
++      .setDescription(
++        `Doors are open — hop into ${channel} now.` +
++          (record.endTime ? `\n\nEnds ${discordTimestamp(record.endTime, 'R')}.` : '')
++      )
++      .setTimestamp(new Date())
++      .setFooter({ text: 'UPRISE Events' });
++
++    await target
++      .send({
++        content,
++        embeds: [embed],
++        allowedMentions: isEveryone ? { parse: ['everyone'] } : { roles: record.pingRoleId ? [record.pingRoleId] : [] },
++      })
++      .catch((err: any) => console.warn('[EventChannelService] Announcement failed:', err.message));
++  }
++
++  private static scheduleTimers(client: Client, record: ScheduledEventChannel) {
++    const now = Date.now();
++    if (record.status === 'PENDING' && record.startTime.getTime() - now <= PRECISE_TIMER_HORIZON_MS) {
++      this.arm(`${record.id}:open`, record.startTime, () => this.openEvent(client, record.id));
++    }
++    if (record.endTime && record.endTime.getTime() - now <= PRECISE_TIMER_HORIZON_MS) {
++      this.arm(`${record.id}:end`, record.endTime, () => this.endEvent(client, record.id, 'scheduled end time reached'));
++    }
++  }
++
++  private static arm(key: string, at: Date, fn: () => Promise<void>) {
++    if (this.timers.has(key)) return;
++    const timer = setTimeout(() => {
++      this.timers.delete(key);
++      fn().catch((err) => console.warn(`[EventChannelService] Timer ${key} failed:`, err.message));
++    }, Math.max(0, at.getTime() - Date.now()));
++    this.timers.set(key, timer);
++  }
++
++  private static clearTimersFor(id: string) {
++    for (const suffix of [':open', ':end']) {
++      const timer = this.timers.get(id + suffix);
++      if (timer) clearTimeout(timer);
++      this.timers.delete(id + suffix);
++    }
++  }
++}
++
++export default EventChannelService;
+--- /dev/null
++++ b/src/services/voiceScheduler.ts
+@@ -0,0 +1,44 @@
++import type { Client } from 'discord.js';
++import EventChannelService from './eventChannelService.ts';
++import VoiceChannelService from './voiceChannelService.ts';
++
++const POLL_INTERVAL_MS = 30 * 1000;
++
++let interval: NodeJS.Timeout | null = null;
++let running = false;
++
++/**
++ * Drives scheduled event channels and dynamic-channel reconciliation.
++ * Started on ClientReady and stopped in stopDiscordBot, so dashboard bot restarts
++ * never stack duplicate intervals.
++ */
++export const VoiceScheduler = {
++  start(client: Client) {
++    this.stop();
++    void this.run(client);
++    interval = setInterval(() => void this.run(client), POLL_INTERVAL_MS);
++    console.log('[VoiceScheduler] Started (30s poll).');
++  },
++
++  stop() {
++    if (interval) clearInterval(interval);
++    interval = null;
++    EventChannelService.clearTimers();
++  },
++
++  async run(client: Client) {
++    // Skip overlapping ticks if Discord is slow
++    if (running || !client.isReady()) return;
++    running = true;
++    try {
++      await EventChannelService.processDue(client);
++      await VoiceChannelService.sweep(client);
++    } catch (err: any) {
++      console.warn('[VoiceScheduler] Tick failed:', err.message);
++    } finally {
++      running = false;
++    }
++  },
++};
++
++export default VoiceScheduler;
+--- /dev/null
++++ b/src/events/voiceStateUpdate.ts
+@@ -0,0 +1,32 @@
++import { ChannelType, Events, type VoiceState } from 'discord.js';
++import VoiceChannelService from '../services/voiceChannelService.ts';
++import EventChannelService from '../services/eventChannelService.ts';
++import config from '../config/config.ts';
++
++export const voiceStateUpdateEvent = {
++  name: Events.VoiceStateUpdate,
++  async execute(oldState: VoiceState, newState: VoiceState) {
++    try {
++      // Left or moved out of a channel: clean up if that left it empty
++      const left = oldState.channel;
++      if (left && left.id !== newState.channelId && left.type === ChannelType.GuildVoice) {
++        await VoiceChannelService.handleChannelLeft(left);
++        await EventChannelService.handleChannelLeft(left.client, left);
++      }
++
++      // Joined the "➕ Create VC" hub
++      if (
++        config.vcHubChannelId &&
++        newState.channelId === config.vcHubChannelId &&
++        oldState.channelId !== newState.channelId &&
++        newState.member
++      ) {
++        await VoiceChannelService.handleHubJoin(newState.member);
++      }
++    } catch (err: any) {
++      console.error('[UPRISE Bot] voiceStateUpdate error:', err);
++    }
++  },
++};
++
++export default voiceStateUpdateEvent;
+--- /dev/null
++++ b/src/commands/vc.ts
+@@ -0,0 +1,354 @@
++import {
++  ActionRowBuilder,
++  ButtonBuilder,
++  ButtonStyle,
++  ChatInputCommandInteraction,
++  EmbedBuilder,
++  InteractionContextType,
++  ModalBuilder,
++  SlashCommandBuilder,
++  TextInputBuilder,
++  TextInputStyle,
++  UserSelectMenuBuilder,
++  type ButtonInteraction,
++  type GuildMember,
++  type ModalSubmitInteraction,
++  type UserSelectMenuInteraction,
++  type VoiceChannel,
++} from 'discord.js';
++import VoiceChannelService, { VoiceActionError } from '../services/voiceChannelService.ts';
++import { humanCount, isRoleLocked } from '../utils/voiceUtils.ts';
++
++export const VC_PANEL_PREFIX = 'uprise_vc:';
++
++const PANEL = {
++  lock: `${VC_PANEL_PREFIX}lock`,
++  unlock: `${VC_PANEL_PREFIX}unlock`,
++  hide: `${VC_PANEL_PREFIX}hide`,
++  unhide: `${VC_PANEL_PREFIX}unhide`,
++  rename: `${VC_PANEL_PREFIX}rename`,
++  limit: `${VC_PANEL_PREFIX}limit`,
++  refresh: `${VC_PANEL_PREFIX}refresh`,
++  permit: `${VC_PANEL_PREFIX}permit`,
++  kick: `${VC_PANEL_PREFIX}kick`,
++  transfer: `${VC_PANEL_PREFIX}transfer`,
++  renameModal: `${VC_PANEL_PREFIX}rename_modal`,
++  limitModal: `${VC_PANEL_PREFIX}limit_modal`,
++} as const;
++
++type PanelInteraction = ButtonInteraction<'cached'> | UserSelectMenuInteraction<'cached'> | ModalSubmitInteraction<'cached'>;
++
++function errorText(err: unknown): string {
++  if (err instanceof VoiceActionError) return err.message;
++  console.error('[vc] Unexpected error:', err);
++  return `Something went wrong: ${(err as Error)?.message || 'unknown error'}`;
++}
++
++/** Overwrite edits don't update discord.js's cache until the gateway echo arrives; force a fresh read. */
++async function refreshed(channel: VoiceChannel): Promise<VoiceChannel> {
++  return (await channel.fetch(true).catch(() => channel)) as VoiceChannel;
++}
++
++async function buildPanel(channel: VoiceChannel, ownerId: string, notice?: string) {
++  channel = await refreshed(channel);
++  const locked = isRoleLocked(channel, 'Connect');
++  const hidden = isRoleLocked(channel, 'ViewChannel');
++  const { remaining, nextAt } = VoiceChannelService.renameStatus(channel.id);
++
++  const embed = new EmbedBuilder()
++    .setTitle('🎛️ Voice Channel Control Panel')
++    .setColor(0x14b8a6)
++    .setDescription(notice ? `${notice}\n​` : null)
++    .addFields(
++      { name: 'Channel', value: `${channel}`, inline: true },
++      { name: 'Owner', value: `<@${ownerId}>`, inline: true },
++      { name: 'Members', value: `${humanCount(channel)}${channel.userLimit ? ` / ${channel.userLimit}` : ''}`, inline: true },
++      { name: 'Access', value: locked ? '🔒 Locked' : '🔓 Open', inline: true },
++      { name: 'Visibility', value: hidden ? '🙈 Hidden' : '👁️ Visible', inline: true },
++      {
++        name: 'Renames left',
++        value: nextAt ? `0 (next <t:${Math.ceil(nextAt.getTime() / 1000)}:R>)` : `${remaining} / 2 per 10 min`,
++        inline: true,
++      }
++    )
++    .setFooter({ text: 'Only you can see and use this panel' });
++
++  const accessRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
++    new ButtonBuilder().setCustomId(PANEL.lock).setLabel('Lock').setEmoji('🔒').setStyle(ButtonStyle.Secondary).setDisabled(locked),
++    new ButtonBuilder().setCustomId(PANEL.unlock).setLabel('Unlock').setEmoji('🔓').setStyle(ButtonStyle.Secondary).setDisabled(!locked),
++    new ButtonBuilder().setCustomId(PANEL.hide).setLabel('Hide').setEmoji('🙈').setStyle(ButtonStyle.Secondary).setDisabled(hidden),
++    new ButtonBuilder().setCustomId(PANEL.unhide).setLabel('Unhide').setEmoji('👁️').setStyle(ButtonStyle.Secondary).setDisabled(!hidden)
++  );
++  const editRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
++    new ButtonBuilder().setCustomId(PANEL.rename).setLabel('Rename').setEmoji('✏️').setStyle(ButtonStyle.Primary).setDisabled(Boolean(nextAt)),
++    new ButtonBuilder().setCustomId(PANEL.limit).setLabel('User Limit').setEmoji('👥').setStyle(ButtonStyle.Primary),
++    new ButtonBuilder().setCustomId(PANEL.refresh).setLabel('Refresh').setEmoji('🔄').setStyle(ButtonStyle.Secondary)
++  );
++  const permitRow = new ActionRowBuilder<UserSelectMenuBuilder>().addComponents(
++    new UserSelectMenuBuilder().setCustomId(PANEL.permit).setPlaceholder('✅ Permit members to join…').setMinValues(1).setMaxValues(5)
++  );
++  const kickRow = new ActionRowBuilder<UserSelectMenuBuilder>().addComponents(
++    new UserSelectMenuBuilder().setCustomId(PANEL.kick).setPlaceholder('⛔ Kick / reject members…').setMinValues(1).setMaxValues(5)
++  );
++  const transferRow = new ActionRowBuilder<UserSelectMenuBuilder>().addComponents(
++    new UserSelectMenuBuilder().setCustomId(PANEL.transfer).setPlaceholder('👑 Transfer ownership to…').setMinValues(1).setMaxValues(1)
++  );
++
++  return { content: '', embeds: [embed], components: [accessRow, editRow, permitRow, kickRow, transferRow] };
++}
++
++async function forEachMember(
++  members: Iterable<GuildMember>,
++  action: (member: GuildMember) => Promise<string>
++): Promise<string> {
++  const lines: string[] = [];
++  for (const member of members) {
++    try {
++      lines.push(`✅ ${await action(member)}`);
++    } catch (err) {
++      lines.push(`❌ ${errorText(err)}`);
++    }
++  }
++  return lines.join('\n') || 'No valid members selected.';
++}
++
++export const vcCommand = {
++  data: new SlashCommandBuilder()
++    .setName('vc')
++    .setDescription('Create and manage your own custom voice channel.')
++    .setContexts(InteractionContextType.Guild)
++    .addSubcommand((sub) =>
++      sub
++        .setName('create')
++        .setDescription('Create your own voice channel.')
++        .addStringOption((o) => o.setName('name').setDescription("Channel name (default: <you>'s Lounge)").setMaxLength(100))
++        .addIntegerOption((o) =>
++          o.setName('user_limit').setDescription('Max members (0 = unlimited)').setMinValue(0).setMaxValue(99)
++        )
++    )
++    .addSubcommand((sub) => sub.setName('menu').setDescription('Open the control panel for your voice channel.'))
++    .addSubcommand((sub) => sub.setName('lock').setDescription('Stop new members from joining your channel.'))
++    .addSubcommand((sub) => sub.setName('unlock').setDescription('Allow members to join your channel again.'))
++    .addSubcommand((sub) => sub.setName('hide').setDescription('Hide your channel from the channel list.'))
++    .addSubcommand((sub) => sub.setName('unhide').setDescription('Make your channel visible again.'))
++    .addSubcommand((sub) =>
++      sub
++        .setName('rename')
++        .setDescription('Rename your channel (Discord allows 2 renames per 10 minutes).')
++        .addStringOption((o) => o.setName('new_name').setDescription('New channel name').setRequired(true).setMaxLength(100))
++    )
++    .addSubcommand((sub) =>
++      sub
++        .setName('limit')
++        .setDescription('Set the member cap for your channel.')
++        .addIntegerOption((o) =>
++          o.setName('number').setDescription('Max members (0 = unlimited)').setRequired(true).setMinValue(0).setMaxValue(99)
++        )
++    )
++    .addSubcommand((sub) =>
++      sub
++        .setName('permit')
++        .setDescription('Let a member see and join your channel, even when locked or hidden.')
++        .addUserOption((o) => o.setName('user').setDescription('Member to permit').setRequired(true))
++    )
++    .addSubcommand((sub) =>
++      sub
++        .setName('kick')
++        .setDescription('Disconnect a member and block them from rejoining.')
++        .addUserOption((o) => o.setName('user').setDescription('Member to kick').setRequired(true))
++    )
++    .addSubcommand((sub) =>
++      sub
++        .setName('transfer')
++        .setDescription('Hand ownership of your channel to another member.')
++        .addUserOption((o) => o.setName('user').setDescription('New owner').setRequired(true))
++    ),
++
++  async execute(interaction: ChatInputCommandInteraction) {
++    if (!interaction.inCachedGuild()) {
++      await interaction.reply({ content: '❌ This command can only be used in a server.', ephemeral: true });
++      return;
++    }
++    await interaction.deferReply({ ephemeral: true });
++
++    const sub = interaction.options.getSubcommand();
++    const { guild, member } = interaction;
++
++    try {
++      if (sub === 'create') {
++        const channel = await VoiceChannelService.createChannel({
++          guild,
++          owner: member,
++          name: interaction.options.getString('name'),
++          userLimit: interaction.options.getInteger('user_limit'),
++        });
++
++        let note = 'Join it within 2 minutes or it will be removed automatically.';
++        if (member.voice.channelId) {
++          const moved = await member.voice.setChannel(channel, 'Moved into new custom VC').then(() => true, () => false);
++          if (moved) note = "I've moved you in.";
++        }
++        await interaction.editReply(await buildPanel(channel, member.id, `✅ Created ${channel}. ${note}`));
++        return;
++      }
++
++      const channel = await VoiceChannelService.requireOwnedChannel(guild, member.id);
++      const target = interaction.options.getMember('user');
++      if (['permit', 'kick', 'transfer'].includes(sub) && !target) {
++        throw new VoiceActionError('That user is not a member of this server.');
++      }
++
++      let result: string;
++      switch (sub) {
++        case 'menu':
++          await interaction.editReply(await buildPanel(channel, member.id));
++          return;
++        case 'lock':
++        case 'unlock':
++          result = await VoiceChannelService.setAccess(await refreshed(channel), 'Connect', sub === 'lock');
++          break;
++        case 'hide':
++        case 'unhide':
++          result = await VoiceChannelService.setAccess(await refreshed(channel), 'ViewChannel', sub === 'hide');
++          break;
++        case 'rename':
++          result = await VoiceChannelService.rename(channel, interaction.options.getString('new_name', true));
++          break;
++        case 'limit':
++          result = await VoiceChannelService.setLimit(channel, interaction.options.getInteger('number', true));
++          break;
++        case 'permit':
++          result = await VoiceChannelService.permit(channel, target!);
++          break;
++        case 'kick':
++          result = await VoiceChannelService.reject(channel, target!, member.id);
++          break;
++        case 'transfer':
++          result = await VoiceChannelService.transfer(channel, member.id, target!);
++          break;
++        default:
++          result = 'Unknown subcommand.';
++      }
++      await interaction.editReply({ content: `✅ ${result}` });
++    } catch (err) {
++      await interaction.editReply({ content: `❌ ${errorText(err)}`, embeds: [], components: [] });
++    }
++  },
++
++  /** Buttons, user-select menus and modals from the /vc menu panel. */
++  async handleComponent(interaction: ButtonInteraction | UserSelectMenuInteraction | ModalSubmitInteraction) {
++    if (!interaction.inCachedGuild()) return;
++    const i = interaction as PanelInteraction;
++    const { guild, user } = i;
++
++    // Rename / limit buttons must answer with a modal (no defer allowed first)
++    if (i.isButton() && (i.customId === PANEL.rename || i.customId === PANEL.limit)) {
++      const channel = await VoiceChannelService.getOwnedChannel(guild, user.id);
++      if (!channel) {
++        await i.reply({ content: "❌ You don't own a custom voice channel anymore.", ephemeral: true });
++        return;
++      }
++      await i.showModal(i.customId === PANEL.rename ? renameModal(channel) : limitModal(channel));
++      return;
++    }
++
++    // Everything else edits the panel message in place
++    if (i.isModalSubmit() && !i.isFromMessage()) await i.deferReply({ ephemeral: true });
++    else await i.deferUpdate();
++
++    let channel: VoiceChannel;
++    try {
++      channel = await VoiceChannelService.requireOwnedChannel(guild, user.id);
++    } catch (err) {
++      await i.editReply({ content: `❌ ${errorText(err)}`, embeds: [], components: [] });
++      return;
++    }
++
++    try {
++      let notice: string;
++      switch (i.customId) {
++        case PANEL.lock:
++        case PANEL.unlock:
++          notice = await VoiceChannelService.setAccess(await refreshed(channel), 'Connect', i.customId === PANEL.lock);
++          break;
++        case PANEL.hide:
++        case PANEL.unhide:
++          notice = await VoiceChannelService.setAccess(await refreshed(channel), 'ViewChannel', i.customId === PANEL.hide);
++          break;
++        case PANEL.refresh:
++          notice = '🔄 Panel refreshed.';
++          break;
++        case PANEL.renameModal:
++          notice = await VoiceChannelService.rename(channel, (i as ModalSubmitInteraction).fields.getTextInputValue('name'));
++          break;
++        case PANEL.limitModal: {
++          const raw = (i as ModalSubmitInteraction).fields.getTextInputValue('limit').trim();
++          if (!/^\d{1,2}$/.test(raw)) throw new VoiceActionError('User limit must be a number between 0 and 99.', channel);
++          notice = await VoiceChannelService.setLimit(channel, parseInt(raw, 10));
++          break;
++        }
++        case PANEL.permit:
++          notice = await forEachMember((i as UserSelectMenuInteraction<'cached'>).members.values(), (m) =>
++            VoiceChannelService.permit(channel, m)
++          );
++          break;
++        case PANEL.kick:
++          notice = await forEachMember((i as UserSelectMenuInteraction<'cached'>).members.values(), (m) =>
++            VoiceChannelService.reject(channel, m, user.id)
++          );
++          break;
++        case PANEL.transfer: {
++          const target = (i as UserSelectMenuInteraction<'cached'>).members.first();
++          if (!target) throw new VoiceActionError('That user is not a member of this server.', channel);
++          const result = await VoiceChannelService.transfer(channel, user.id, target);
++          await i.editReply({ content: `✅ ${result}\nYou no longer own this channel, so this panel is closed.`, embeds: [], components: [] });
++          return;
++        }
++        default:
++          return;
++      }
++      // Permit/kick results already carry per-member ✅/❌ markers
++      await i.editReply(await buildPanel(channel, user.id, /^[✅❌🔄]/u.test(notice) ? notice : `✅ ${notice}`));
++    } catch (err) {
++      await i.editReply(await buildPanel(channel, user.id, `❌ ${errorText(err)}`));
++    }
++  },
++};
++
++function renameModal(channel: VoiceChannel): ModalBuilder {
++  return new ModalBuilder()
++    .setCustomId(PANEL.renameModal)
++    .setTitle('Rename Voice Channel')
++    .addComponents(
++      new ActionRowBuilder<TextInputBuilder>().addComponents(
++        new TextInputBuilder()
++          .setCustomId('name')
++          .setLabel('New channel name')
++          .setStyle(TextInputStyle.Short)
++          .setMinLength(1)
++          .setMaxLength(100)
++          .setValue(channel.name.slice(0, 100))
++          .setRequired(true)
++      )
++    );
++}
++
++function limitModal(channel: VoiceChannel): ModalBuilder {
++  return new ModalBuilder()
++    .setCustomId(PANEL.limitModal)
++    .setTitle('Set User Limit')
++    .addComponents(
++      new ActionRowBuilder<TextInputBuilder>().addComponents(
++        new TextInputBuilder()
++          .setCustomId('limit')
++          .setLabel('Max members (0 = unlimited, max 99)')
++          .setStyle(TextInputStyle.Short)
++          .setMinLength(1)
++          .setMaxLength(2)
++          .setValue(String(channel.userLimit))
++          .setRequired(true)
++      )
++    );
++}
++
++export default vcCommand;
+--- /dev/null
++++ b/src/commands/eventVc.ts
+@@ -0,0 +1,184 @@
++import {
++  ChannelType,
++  ChatInputCommandInteraction,
++  EmbedBuilder,
++  InteractionContextType,
++  PermissionFlagsBits,
++  SlashCommandBuilder,
++} from 'discord.js';
++import EventChannelService from '../services/eventChannelService.ts';
++import { discordTimestamp, parseTimeInput } from '../utils/timeParser.ts';
++
++const MAX_SCHEDULE_AHEAD_MS = 365 * 24 * 60 * 60 * 1000;
++const TIME_HELP =
++  'Use a duration (`30m`, `2h`, `1h30m`), a Discord/Unix timestamp, or ISO (`2026-10-05T18:00+05:30`; no offset = UTC).';
++
++const STATUS_LABEL: Record<string, string> = {
++  PENDING: '⏳ Scheduled',
++  ACTIVE: '🟢 Live',
++};
++
++export const eventVcCommand = {
++  data: new SlashCommandBuilder()
++    .setName('event-vc')
++    .setDescription('[EVENT STAFF] Schedule voice channels that unlock automatically.')
++    // Hidden from regular members by default; server admins can also grant the Event Manager
++    // role access under Server Settings → Integrations. The runtime check below is authoritative.
++    .setDefaultMemberPermissions(PermissionFlagsBits.ManageEvents)
++    .setContexts(InteractionContextType.Guild)
++    .addSubcommand((sub) =>
++      sub
++        .setName('create')
++        .setDescription('Create a locked event voice channel that opens at the start time.')
++        .addStringOption((o) => o.setName('name').setDescription('Channel / event name').setRequired(true).setMaxLength(100))
++        .addStringOption((o) =>
++          o.setName('start_time').setDescription('When doors open: "now", "30m", "2h", timestamp or ISO date').setRequired(true)
++        )
++        .addStringOption((o) =>
++          o.setName('end_time').setDescription('When it closes: duration after start ("2h") or absolute time. Omit = when empty')
++        )
++        .addIntegerOption((o) => o.setName('limit').setDescription('Max members (0 = unlimited)').setMinValue(0).setMaxValue(99))
++        .addBooleanOption((o) => o.setName('hidden').setDescription('Hide the channel until it opens (default: visible but locked)'))
++        .addChannelOption((o) =>
++          o
++            .setName('announce_channel')
++            .setDescription('Where to post the "event is live" alert (default: configured channel)')
++            .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)
++        )
++        .addRoleOption((o) => o.setName('ping_role').setDescription('Role to ping when the event opens'))
++    )
++    .addSubcommand((sub) => sub.setName('list').setDescription('List scheduled and live event channels.'))
++    .addSubcommand((sub) =>
++      sub
++        .setName('cancel')
++        .setDescription('Cancel a scheduled or live event and delete its channel.')
++        .addChannelOption((o) =>
++          o.setName('channel').setDescription('The event voice channel').setRequired(true).addChannelTypes(ChannelType.GuildVoice)
++        )
++    ),
++
++  async execute(interaction: ChatInputCommandInteraction) {
++    if (!interaction.inCachedGuild()) {
++      await interaction.reply({ content: '❌ This command can only be used in a server.', ephemeral: true });
++      return;
++    }
++    await interaction.deferReply({ ephemeral: true });
++
++    if (!EventChannelService.canManageEvents(interaction.member)) {
++      await interaction.editReply({ content: '❌ Only Admins and Event Managers can manage event voice channels.' });
++      return;
++    }
++
++    const sub = interaction.options.getSubcommand();
++    try {
++      if (sub === 'create') await this.create(interaction);
++      else if (sub === 'list') await this.list(interaction);
++      else if (sub === 'cancel') await this.cancel(interaction);
++    } catch (err: any) {
++      console.error('[event-vc] Error:', err);
++      await interaction.editReply({ content: `❌ ${err.message}` });
++    }
++  },
++
++  async create(interaction: ChatInputCommandInteraction<'cached'>) {
++    const now = new Date();
++    const name = interaction.options.getString('name', true).trim();
++    const startRaw = interaction.options.getString('start_time', true);
++    const endRaw = interaction.options.getString('end_time');
++
++    const startTime = startRaw.trim().toLowerCase() === 'now' ? now : parseTimeInput(startRaw, now);
++    if (!startTime) {
++      await interaction.editReply({ content: `❌ Couldn't understand start_time \`${startRaw}\`. ${TIME_HELP}` });
++      return;
++    }
++    // Small tolerance so "now"-ish absolute times typed a few seconds late still work
++    if (startTime.getTime() < now.getTime() - 60 * 1000) {
++      await interaction.editReply({ content: `❌ start_time ${discordTimestamp(startTime)} is in the past.` });
++      return;
++    }
++    if (startTime.getTime() - now.getTime() > MAX_SCHEDULE_AHEAD_MS) {
++      await interaction.editReply({ content: '❌ Events can be scheduled at most one year ahead.' });
++      return;
++    }
++
++    // Durations in end_time are relative to the start, e.g. start "18:00" + end "2h"
++    const endTime = endRaw ? parseTimeInput(endRaw, startTime) : null;
++    if (endRaw && !endTime) {
++      await interaction.editReply({ content: `❌ Couldn't understand end_time \`${endRaw}\`. ${TIME_HELP}` });
++      return;
++    }
++    if (endTime && endTime.getTime() <= startTime.getTime()) {
++      await interaction.editReply({ content: '❌ end_time must be after start_time.' });
++      return;
++    }
++
++    const pingRole = interaction.options.getRole('ping_role');
++    const { record, channel } = await EventChannelService.createEvent({
++      guild: interaction.guild,
++      creator: interaction.member,
++      name,
++      startTime,
++      endTime,
++      userLimit: interaction.options.getInteger('limit') ?? 0,
++      hidden: interaction.options.getBoolean('hidden') ?? false,
++      announceChannelId: interaction.options.getChannel('announce_channel')?.id ?? null,
++      pingRoleId: pingRole?.id ?? null,
++    });
++
++    const embed = new EmbedBuilder()
++      .setTitle(record.status === 'ACTIVE' ? '🟢 Event Voice Channel Live' : '📅 Event Voice Channel Scheduled')
++      .setColor(0x14b8a6)
++      .addFields(
++        { name: 'Channel', value: `${channel}`, inline: true },
++        { name: 'Status', value: STATUS_LABEL[record.status] || record.status, inline: true },
++        { name: 'User Limit', value: record.userLimit ? String(record.userLimit) : 'Unlimited', inline: true },
++        { name: 'Opens', value: `${discordTimestamp(startTime)} (${discordTimestamp(startTime, 'R')})`, inline: false },
++        {
++          name: 'Closes',
++          value: endTime ? `${discordTimestamp(endTime)} (${discordTimestamp(endTime, 'R')})` : 'When the channel empties after opening',
++          inline: false,
++        },
++        { name: 'Ping', value: pingRole ? `${pingRole}` : 'None', inline: true },
++        { name: 'Visibility before start', value: record.hidden ? '🙈 Hidden' : '👁️ Visible (locked)', inline: true }
++      )
++      .setFooter({ text: 'Times are shown in your local timezone. You have early access to set up.' });
++
++    await interaction.editReply({ embeds: [embed] });
++  },
++
++  async list(interaction: ChatInputCommandInteraction<'cached'>) {
++    const events = await EventChannelService.listOpen(interaction.guild.id);
++    if (!events.length) {
++      await interaction.editReply({ content: 'No scheduled or live event channels.' });
++      return;
++    }
++
++    const lines = events.map((e) => {
++      const timing =
++        e.status === 'PENDING'
++          ? `opens ${discordTimestamp(e.startTime, 'R')}`
++          : e.endTime
++            ? `ends ${discordTimestamp(e.endTime, 'R')}`
++            : 'ends when empty';
++      return `${STATUS_LABEL[e.status] || e.status} **${e.name}** — <#${e.channelId}> · ${timing}`;
++    });
++
++    await interaction.editReply({
++      embeds: [new EmbedBuilder().setTitle('📅 Event Voice Channels').setColor(0x14b8a6).setDescription(lines.join('\n'))],
++    });
++  },
++
++  async cancel(interaction: ChatInputCommandInteraction<'cached'>) {
++    const channel = interaction.options.getChannel('channel', true);
++    const record = await EventChannelService.findOpenByChannel(channel.id);
++    if (!record) {
++      await interaction.editReply({ content: `❌ ${channel} is not a scheduled or live event channel.` });
++      return;
++    }
++
++    await EventChannelService.cancelEvent(interaction.client, record, interaction.user.username);
++    await interaction.editReply({ content: `✅ Event **${record.name}** cancelled and its channel removed.` });
++  },
++};
++
++export default eventVcCommand;

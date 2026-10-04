@@ -1,0 +1,131 @@
+// Prisma Schema for UPRISE Discord Bot MVP
+// Configured for SQLite with clean abstraction for PostgreSQL migration
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id          String   @id @default(cuid())
+  discordId   String   @unique
+  username    String
+  email       String?
+  fullName    String?
+  phone       String?
+  verifiedAt  DateTime?
+  xp          Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  // Referrals made by this user (as inviter)
+  referralsGiven   Referral[]      @relation("InviterReferrals")
+  // Referral that brought this user (as invitee, at most one)
+  referralReceived Referral?       @relation("InviteeReferral")
+  // Ledger of all XP adjustments
+  xpTransactions   XPTransaction[]
+}
+
+model Referral {
+  id         String    @id @default(cuid())
+  inviterId  String?
+  inviteeId  String    @unique
+  inviteCode String?
+  status     String    @default("PENDING") // PENDING, VALID, INVALID
+  joinedAt   DateTime  @default(now())
+  verifiedAt DateTime?
+  rewardedAt DateTime?
+
+  inviter        User?           @relation("InviterReferrals", fields: [inviterId], references: [id], onDelete: SetNull)
+  invitee        User            @relation("InviteeReferral", fields: [inviteeId], references: [id], onDelete: Cascade)
+  xpTransactions XPTransaction[]
+}
+
+model XPTransaction {
+  id         String    @id @default(cuid())
+  userId     String
+  amount     Int
+  reason     String    // e.g. "NEW_MEMBER_VERIFICATION", "SUCCESSFUL_REFERRAL", "ADMIN_ADJUSTMENT"
+  referralId String?
+  createdAt  DateTime  @default(now())
+
+  user     User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  referral Referral? @relation(fields: [referralId], references: [id], onDelete: SetNull)
+}
+
+model TrackedInvite {
+  code             String   @id
+  inviterDiscordId String?
+  uses             Int      @default(0)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+}
+
+model BotLog {
+  id        String   @id @default(cuid())
+  type      String   // JOIN, INVITE_DETECTED, VERIFICATION, REFERRAL_VALIDATED, XP_AWARDED, ERROR, ADMIN
+  title     String
+  message   String
+  metadata  String?  // JSON string
+  createdAt DateTime @default(now())
+}
+
+model OTPVerification {
+  id        String   @id @default(cuid())
+  email     String
+  otp       String
+  discordId String?
+  fullName  String?
+  phone     String?
+  expiresAt DateTime
+  verified  Boolean  @default(false)
+  createdAt DateTime @default(now())
+}
+
+model SystemSetting {
+  key       String   @id
+  value     String
+  updatedAt DateTime @updatedAt
+}
+
+
+// Member-owned temporary voice channels ("Join-to-Create" hub or /vc create).
+// Deleted automatically once the last human leaves.
+model DynamicVoiceChannel {
+  id        String   @id @default(cuid())
+  guildId   String
+  channelId String   @unique
+  ownerId   String
+  createdAt DateTime @default(now())
+
+  // A member can own at most one dynamic channel per guild (also blocks double-create races)
+  @@unique([guildId, ownerId])
+}
+
+// Event voice channels that are created locked and unlock automatically at startTime.
+model ScheduledEventChannel {
+  id                String    @id @default(cuid())
+  guildId           String
+  channelId         String    @unique
+  name              String
+  startTime         DateTime
+  endTime           DateTime? // null = event ends once the channel empties after opening
+  status            String    @default("PENDING") // PENDING, ACTIVE, ENDED, CANCELLED
+  creatorId         String
+  userLimit         Int       @default(0)
+  hidden            Boolean   @default(false)
+  announceChannelId String?
+  pingRoleId        String?
+  openedAt          DateTime?
+  endedAt           DateTime?
+  channelDeletedAt  DateTime? // set once the Discord channel is gone, so sweeps can skip the row
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  @@index([status, startTime])
+  @@index([status, endTime])
+}

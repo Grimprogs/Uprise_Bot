@@ -1,0 +1,6 @@
+{
+  "name": "UPRISE Discord Bot & Community Console",
+  "description": "Discord invite tracking, member verification, auditable XP ledger, and global leaderboard engine for the UPRISE community.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
