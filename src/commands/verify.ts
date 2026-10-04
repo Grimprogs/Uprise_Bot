@@ -8,7 +8,7 @@ import {
   ButtonStyle,
   GuildMember,
 } from 'discord.js';
-import VerificationService from '../services/verificationService.js';
+import VerificationService from '../services/verificationService.ts';
 
 export const VERIFY_BUTTON_ID = 'uprise_verify_btn';
 

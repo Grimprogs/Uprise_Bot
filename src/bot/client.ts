@@ -1,19 +1,19 @@
 import { Client, GatewayIntentBits, Partials, REST, Routes, Events } from 'discord.js';
-import config, { isDiscordConfigured } from '../config/config.js';
-import InviteService from '../services/inviteService.js';
-import ReferralService from '../services/referralService.js';
-import Logger from '../utils/logger.js';
-import readyEvent from '../events/ready.js';
-import guildMemberAddEvent from '../events/guildMemberAdd.js';
-import guildMemberRemoveEvent from '../events/guildMemberRemove.js';
-import interactionCreateEvent from '../events/interactionCreate.js';
+import config, { isDiscordConfigured } from '../config/config.ts';
+import InviteService from '../services/inviteService.ts';
+import ReferralService from '../services/referralService.ts';
+import Logger from '../utils/logger.ts';
+import readyEvent from '../events/ready.ts';
+import guildMemberAddEvent from '../events/guildMemberAdd.ts';
+import guildMemberRemoveEvent from '../events/guildMemberRemove.ts';
+import interactionCreateEvent from '../events/interactionCreate.ts';
 
-import verifyCommand from '../commands/verify.js';
-import xpCommand from '../commands/xp.js';
-import leaderboardCommand from '../commands/leaderboard.js';
-import referralsCommand from '../commands/referrals.js';
-import adminXpCommand from '../commands/adminXp.js';
-import adminReferralCommand from '../commands/adminReferral.js';
+import verifyCommand from '../commands/verify.ts';
+import xpCommand from '../commands/xp.ts';
+import leaderboardCommand from '../commands/leaderboard.ts';
+import referralsCommand from '../commands/referrals.ts';
+import adminXpCommand from '../commands/adminXp.ts';
+import adminReferralCommand from '../commands/adminReferral.ts';
 
 export const allCommands = [
   verifyCommand,

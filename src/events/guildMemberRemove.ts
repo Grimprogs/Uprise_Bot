@@ -1,5 +1,5 @@
-import { Events, GuildMember, PartialGuildMember } from 'discord.js';
-import ReferralService from '../services/referralService.js';
+import { Events, GuildMember, type PartialGuildMember } from 'discord.js';
+import ReferralService from '../services/referralService.ts';
 
 export const guildMemberRemoveEvent = {
   name: Events.GuildMemberRemove,

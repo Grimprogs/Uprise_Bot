@@ -1,6 +1,6 @@
-import config, { isDiscordConfigured } from './config/config.js';
-import prisma from './database/prisma.js';
-import { startDiscordBot, stopDiscordBot } from './bot/client.js';
+import config, { isDiscordConfigured } from './config/config.ts';
+import prisma from './database/prisma.ts';
+import { startDiscordBot, stopDiscordBot } from './bot/client.ts';
 
 async function main() {
   console.log('----------------------------------------------------');

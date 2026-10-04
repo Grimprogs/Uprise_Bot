@@ -1,12 +1,12 @@
-import { Events, Interaction } from 'discord.js';
-import verifyCommand, { VERIFY_BUTTON_ID } from '../commands/verify.js';
-import xpCommand from '../commands/xp.js';
-import leaderboardCommand, { LEADERBOARD_PREV_ID, LEADERBOARD_NEXT_ID } from '../commands/leaderboard.js';
-import referralsCommand from '../commands/referrals.js';
-import adminXpCommand from '../commands/adminXp.js';
-import adminReferralCommand from '../commands/adminReferral.js';
-import ReferralService from '../services/referralService.js';
-import Logger from '../utils/logger.js';
+import { Events, type Interaction } from 'discord.js';
+import verifyCommand, { VERIFY_BUTTON_ID } from '../commands/verify.ts';
+import xpCommand from '../commands/xp.ts';
+import leaderboardCommand, { LEADERBOARD_PREV_ID, LEADERBOARD_NEXT_ID } from '../commands/leaderboard.ts';
+import referralsCommand from '../commands/referrals.ts';
+import adminXpCommand from '../commands/adminXp.ts';
+import adminReferralCommand from '../commands/adminReferral.ts';
+import ReferralService from '../services/referralService.ts';
+import Logger from '../utils/logger.ts';
 
 export const interactionCreateEvent = {
   name: Events.InteractionCreate,

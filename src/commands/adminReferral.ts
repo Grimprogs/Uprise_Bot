@@ -4,7 +4,7 @@ import {
   EmbedBuilder,
   PermissionFlagsBits,
 } from 'discord.js';
-import ReferralService from '../services/referralService.js';
+import ReferralService from '../services/referralService.ts';
 
 export const adminReferralCommand = {
   data: new SlashCommandBuilder()

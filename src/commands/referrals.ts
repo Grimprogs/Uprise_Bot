@@ -1,5 +1,5 @@
 import { SlashCommandBuilder, ChatInputCommandInteraction, EmbedBuilder } from 'discord.js';
-import ReferralService from '../services/referralService.js';
+import ReferralService from '../services/referralService.ts';
 
 export const referralsCommand = {
   data: new SlashCommandBuilder()
@@ -13,7 +13,7 @@ export const referralsCommand = {
     ),
 
   async execute(interaction: ChatInputCommandInteraction) {
-    await interaction.deferReply();
+    await interaction.deferReply({ ephemeral: true });
 
     const targetUser = interaction.options.getUser('user') || interaction.user;
     const stats = await ReferralService.getReferralStats(targetUser.id);

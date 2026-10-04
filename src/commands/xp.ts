@@ -1,6 +1,6 @@
 import { SlashCommandBuilder, ChatInputCommandInteraction, EmbedBuilder } from 'discord.js';
-import LeaderboardService from '../services/leaderboardService.js';
-import XpService from '../services/xpService.js';
+import LeaderboardService from '../services/leaderboardService.ts';
+import XpService from '../services/xpService.ts';
 
 export const xpCommand = {
   data: new SlashCommandBuilder()
@@ -14,7 +14,7 @@ export const xpCommand = {
     ),
 
   async execute(interaction: ChatInputCommandInteraction) {
-    await interaction.deferReply();
+    await interaction.deferReply({ ephemeral: true });
 
     const targetUser = interaction.options.getUser('user') || interaction.user;
     

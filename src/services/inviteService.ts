@@ -1,6 +1,6 @@
 import { Guild, Collection, Invite } from 'discord.js';
-import prisma from '../database/prisma.js';
-import Logger from '../utils/logger.js';
+import prisma from '../database/prisma.ts';
+import Logger from '../utils/logger.ts';
 
 export interface CachedInviteData {
   code: string;

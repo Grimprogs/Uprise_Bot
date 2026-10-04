@@ -1,4 +1,4 @@
-import { deploySlashCommands } from '../src/bot/client.js';
+import { deploySlashCommands } from '../src/bot/client.ts';
 
 async function run() {
   console.log('Deploying slash commands to Discord...');

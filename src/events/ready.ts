@@ -1,8 +1,9 @@
 import { Client, Events, EmbedBuilder, TextChannel } from 'discord.js';
-import InviteService from '../services/inviteService.js';
-import { createVerificationButtonRow } from '../commands/verify.js';
-import Logger from '../utils/logger.js';
-import config from '../config/config.js';
+import InviteService from '../services/inviteService.ts';
+import LeaderboardService from '../services/leaderboardService.ts';
+import { createVerificationButtonRow } from '../commands/verify.ts';
+import Logger from '../utils/logger.ts';
+import config from '../config/config.ts';
 
 export const readyEvent = {
   name: Events.ClientReady,
@@ -77,6 +78,14 @@ export const readyEvent = {
           }
         }
       }
+
+      // Ensure official leaderboard message is up-to-date in #🏆・leaderboard
+      await LeaderboardService.updateChannelLeaderboard(client);
+
+      // Automatically refresh official leaderboard channel embed every 10 minutes
+      setInterval(() => {
+        LeaderboardService.updateChannelLeaderboard(client).catch(() => {});
+      }, 10 * 60 * 1000);
     } catch (err: any) {
       console.error('[UPRISE Bot] Error during ready guild initialization:', err);
     }

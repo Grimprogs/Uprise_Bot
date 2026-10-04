@@ -1,15 +1,15 @@
 import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import config, { isDiscordConfigured } from './src/config/config.js';
-import prisma from './src/database/prisma.js';
-import { startDiscordBot, stopDiscordBot, isBotOnline, getBotClient } from './src/bot/client.js';
-import VerificationService from './src/services/verificationService.js';
-import ReferralService from './src/services/referralService.js';
-import XpService from './src/services/xpService.js';
-import LeaderboardService from './src/services/leaderboardService.js';
-import InviteService from './src/services/inviteService.js';
-import Logger from './src/utils/logger.js';
+import config, { isDiscordConfigured } from './src/config/config.ts';
+import prisma from './src/database/prisma.ts';
+import { startDiscordBot, stopDiscordBot, isBotOnline, getBotClient } from './src/bot/client.ts';
+import VerificationService from './src/services/verificationService.ts';
+import ReferralService from './src/services/referralService.ts';
+import XpService from './src/services/xpService.ts';
+import LeaderboardService from './src/services/leaderboardService.ts';
+import InviteService from './src/services/inviteService.ts';
+import Logger from './src/utils/logger.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);

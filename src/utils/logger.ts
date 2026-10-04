@@ -1,7 +1,7 @@
 import { Client, EmbedBuilder, TextChannel } from 'discord.js';
-import prisma from '../database/prisma.js';
-import config from '../config/config.js';
-import { getDiscordBotClient } from '../bot/client.js';
+import prisma from '../database/prisma.ts';
+import config from '../config/config.ts';
+import { getDiscordBotClient } from '../bot/client.ts';
 
 export type LogLevel = 'info' | 'warn' | 'error' | 'success';
 

@@ -1,8 +1,9 @@
 import { GuildMember, EmbedBuilder } from 'discord.js';
-import prisma from '../database/prisma.js';
-import XpService from './xpService.js';
-import Logger from '../utils/logger.js';
-import config from '../config/config.js';
+import prisma from '../database/prisma.ts';
+import XpService from './xpService.ts';
+import LeaderboardService from './leaderboardService.ts';
+import Logger from '../utils/logger.ts';
+import config from '../config/config.ts';
 
 export interface VerifyResult {
   success: boolean;
@@ -175,6 +176,9 @@ export class VerificationService {
         inviteCode: inviteCode || 'Direct Join',
       },
     });
+
+    // 8. Auto-update the official leaderboard channel
+    LeaderboardService.updateChannelLeaderboard(Logger.getDiscordClient()).catch(() => {});
 
     return {
       success: true,

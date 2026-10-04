@@ -1,9 +1,9 @@
 import { Events, GuildMember, EmbedBuilder, TextChannel } from 'discord.js';
-import InviteService from '../services/inviteService.js';
-import ReferralService from '../services/referralService.js';
-import { createVerificationButtonRow } from '../commands/verify.js';
-import config from '../config/config.js';
-import Logger from '../utils/logger.js';
+import InviteService from '../services/inviteService.ts';
+import ReferralService from '../services/referralService.ts';
+import { createVerificationButtonRow } from '../commands/verify.ts';
+import config from '../config/config.ts';
+import Logger from '../utils/logger.ts';
 
 export const guildMemberAddEvent = {
   name: Events.GuildMemberAdd,

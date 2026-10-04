@@ -4,7 +4,8 @@ import {
   EmbedBuilder,
   PermissionFlagsBits,
 } from 'discord.js';
-import XpService from '../services/xpService.js';
+import XpService from '../services/xpService.ts';
+import LeaderboardService from '../services/leaderboardService.ts';
 
 export const adminXpCommand = {
   data: new SlashCommandBuilder()
@@ -62,6 +63,9 @@ export const adminXpCommand = {
         .setTimestamp(new Date());
 
       await interaction.editReply({ embeds: [embed] });
+
+      // Refresh official leaderboard channel display
+      LeaderboardService.updateChannelLeaderboard(interaction.client).catch(() => {});
     } catch (err: any) {
       await interaction.editReply({
         content: `❌ Failed to adjust XP: ${err.message}`,

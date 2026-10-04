@@ -1,11 +1,11 @@
 import React, { useState, useEffect } from 'react';
-import Navbar, { TabType } from './components/Navbar.js';
-import DiscordSimulator from './components/DiscordSimulator.js';
-import LeaderboardView from './components/LeaderboardView.js';
-import LedgerView from './components/LedgerView.js';
-import ReferralsView from './components/ReferralsView.js';
-import BotLogsView from './components/BotLogsView.js';
-import SetupGuideView from './components/SetupGuideView.js';
+import Navbar, { TabType } from './components/Navbar.tsx';
+import DiscordSimulator from './components/DiscordSimulator.tsx';
+import LeaderboardView from './components/LeaderboardView.tsx';
+import LedgerView from './components/LedgerView.tsx';
+import ReferralsView from './components/ReferralsView.tsx';
+import BotLogsView from './components/BotLogsView.tsx';
+import SetupGuideView from './components/SetupGuideView.tsx';
 import { Database, ShieldCheck, Sparkles, RefreshCcw, Trash2, ArrowUpRight } from 'lucide-react';
 
 export function App() {
