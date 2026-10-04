@@ -1,52 +1,97 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import Navbar, { TabType } from './components/Navbar.tsx';
-import DiscordSimulator from './components/DiscordSimulator.tsx';
+import MembersView from './components/MembersView.tsx';
+import ReferralsView from './components/ReferralsView.tsx';
+import InvitesView from './components/InvitesView.tsx';
+import GoogleSheetsHub from './components/GoogleSheetsHub.tsx';
+import CommandsGuideView from './components/CommandsGuideView.tsx';
 import LeaderboardView from './components/LeaderboardView.tsx';
 import LedgerView from './components/LedgerView.tsx';
-import ReferralsView from './components/ReferralsView.tsx';
 import BotLogsView from './components/BotLogsView.tsx';
-import SetupGuideView from './components/SetupGuideView.tsx';
-import { Database, ShieldCheck, Sparkles, RefreshCcw, Trash2, ArrowUpRight } from 'lucide-react';
+import { Database, FileSpreadsheet, Zap, Radio, RefreshCcw } from 'lucide-react';
 
 export function App() {
-  const [activeTab, setActiveTab] = useState<TabType>('simulator');
+  const [activeTab, setActiveTab] = useState<TabType>('members');
   const [statusData, setStatusData] = useState<any>(null);
   const [isRefreshing, setIsRefreshing] = useState(false);
-  const fetchStatus = async () => {
+  const [realtimeConnected, setRealtimeConnected] = useState(false);
+  const [settings, setSettings] = useState<Record<string, string>>({});
+
+  const fetchStatus = useCallback(async () => {
     setIsRefreshing(true);
     try {
-      const res = await fetch('/api/status');
-      const data = await res.json();
-      setStatusData(data);
+      const [statusRes, settingsRes] = await Promise.all([
+        fetch('/api/status'),
+        fetch('/api/settings'),
+      ]);
+      const sData = await statusRes.json();
+      const settsData = await settingsRes.json();
+      setStatusData(sData);
+      setSettings(settsData || {});
     } catch (err) {
       console.error('Failed to fetch status:', err);
     } finally {
       setIsRefreshing(false);
     }
-  };
-
-  useEffect(() => {
-    fetchStatus();
   }, []);
 
-  const handleResetDb = async () => {
-    if (!confirm('Are you sure you want to reset all test database records?')) return;
-    try {
-      await fetch('/api/simulate/reset', { method: 'POST' });
-      await fetchStatus();
-    } catch (err) {
-      console.error('Reset failed:', err);
-    }
-  };
+  // Initial load
+  useEffect(() => {
+    fetchStatus();
+  }, [fetchStatus]);
 
-  const handleSeedDb = async () => {
+  // Real-time Server-Sent Events (SSE) listener
+  useEffect(() => {
+    let eventSource: EventSource | null = null;
     try {
-      await fetch('/api/seed', { method: 'POST' });
-      await fetchStatus();
-    } catch (err) {
-      console.error('Seed failed:', err);
+      eventSource = new EventSource('/api/events');
+
+      eventSource.onopen = () => {
+        setRealtimeConnected(true);
+      };
+
+      eventSource.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          // Auto-refresh metrics on any database mutation event
+          if (
+            [
+              'MEMBER_CREATED',
+              'MEMBER_UPDATED',
+              'MEMBER_DELETED',
+              'REFERRAL_CREATED',
+              'REFERRAL_UPDATED',
+              'REFERRAL_DELETED',
+              'MEMBER_VERIFIED',
+              'INVITE_CREATED',
+              'INVITE_DELETED',
+              'SETTINGS_UPDATED',
+              'BOT_STATUS',
+            ].includes(data.type)
+          ) {
+            fetchStatus();
+          }
+        } catch (e) {
+          console.warn('Error parsing SSE event:', e);
+        }
+      };
+
+      eventSource.onerror = () => {
+        setRealtimeConnected(false);
+      };
+    } catch (e) {
+      console.warn('SSE connection failed:', e);
     }
-  };
+
+    return () => {
+      if (eventSource) {
+        eventSource.close();
+      }
+    };
+  }, [fetchStatus]);
+
+  const spreadsheetId = settings['google_spreadsheet_id'] || statusData?.googleSheet?.spreadsheetId;
+  const spreadsheetUrl = settings['google_spreadsheet_url'] || (spreadsheetId ? `https://docs.google.com/spreadsheets/d/${spreadsheetId}` : null);
 
   return (
     <div className="min-h-screen bg-[#0b0e14] text-slate-100 flex flex-col font-sans">
@@ -56,23 +101,16 @@ export function App() {
         botOnline={statusData?.botOnline || false}
         onRefresh={fetchStatus}
         isRefreshing={isRefreshing}
+        realtimeConnected={realtimeConnected}
       />
 
-      {/* Metric Telemetry & Environment Bar */}
-      <section className="border-b border-slate-800/80 bg-[#0e121b] px-4 lg:px-8 py-3">
+      {/* Real-time Telemetry & Data Storage Bar */}
+      <section className="border-b border-slate-800/80 bg-[#0e121b] px-4 lg:px-8 py-2.5">
         <div className="max-w-7xl mx-auto flex flex-wrap items-center justify-between gap-4 text-xs">
           {/* Key Metrics */}
           <div className="flex flex-wrap items-center gap-4 sm:gap-6 text-slate-400">
             <div className="flex items-center gap-1.5">
-              <span>Database:</span>
-              <span className="text-slate-200 font-mono flex items-center gap-1">
-                <Database className="w-3.5 h-3.5 text-indigo-400" />
-                SQLite (data/uprise.db)
-              </span>
-            </div>
-
-            <div className="flex items-center gap-1.5">
-              <span>Community Members:</span>
+              <span>Members:</span>
               <span className="text-white font-mono font-semibold tabular-nums">
                 {statusData?.counts?.users ?? 0}
               </span>
@@ -80,80 +118,97 @@ export function App() {
 
             <div className="flex items-center gap-1.5">
               <span>Referrals:</span>
-              <span className="text-white font-mono font-semibold tabular-nums">
-                {statusData?.counts?.validReferrals ?? 0} Valid / {statusData?.counts?.pendingReferrals ?? 0} Pending
+              <span className="text-emerald-400 font-mono font-semibold tabular-nums">
+                {statusData?.counts?.validReferrals ?? 0} Valid
+              </span>
+              <span className="text-slate-500">/</span>
+              <span className="text-amber-400 font-mono font-semibold tabular-nums">
+                {statusData?.counts?.pendingReferrals ?? 0} Pending
               </span>
             </div>
 
             <div className="flex items-center gap-1.5">
-              <span>Audited XP Transactions:</span>
-              <span className="text-emerald-400 font-mono font-semibold tabular-nums">
-                {statusData?.counts?.transactions ?? 0}
+              <span>Audited XP Ledger:</span>
+              <span className="text-indigo-400 font-mono font-semibold tabular-nums">
+                {statusData?.counts?.transactions ?? 0} tx
               </span>
+            </div>
+
+            <div className="flex items-center gap-1.5">
+              <span>Google Sheet:</span>
+              {spreadsheetUrl ? (
+                <a
+                  href={spreadsheetUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="text-emerald-400 hover:underline font-mono flex items-center gap-1"
+                >
+                  <FileSpreadsheet className="w-3.5 h-3.5" />
+                  <span>Linked & Syncing ↗</span>
+                </a>
+              ) : (
+                <button
+                  onClick={() => setActiveTab('sheets')}
+                  className="text-slate-500 hover:text-slate-300 italic"
+                >
+                  Click to link spreadsheet
+                </button>
+              )}
             </div>
           </div>
 
-          {/* Quick Actions */}
+          {/* Real-time Status Badge */}
           <div className="flex items-center gap-2">
-            <button
-              onClick={handleSeedDb}
-              title="Seed sample test community members (Anurag, Priya, Rahul)"
-              className="px-2.5 py-1 text-slate-300 hover:text-white bg-slate-800/60 hover:bg-slate-800 border border-slate-700/60 rounded text-[11px] font-medium flex items-center gap-1.5 transition-colors"
+            <span
+              className={`flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-mono border ${
+                realtimeConnected
+                  ? 'bg-emerald-950/40 border-emerald-800 text-emerald-400'
+                  : 'bg-slate-800 border-slate-700 text-slate-400'
+              }`}
             >
-              <Sparkles className="w-3 h-3 text-amber-400" />
-              <span>Seed Test Data</span>
-            </button>
-
-            <button
-              onClick={handleResetDb}
-              title="Clear all database tables for a fresh test run"
-              className="px-2.5 py-1 text-slate-400 hover:text-red-400 bg-slate-800/60 hover:bg-red-950/30 border border-slate-700/60 hover:border-red-900 rounded text-[11px] font-medium flex items-center gap-1.5 transition-colors"
-            >
-              <Trash2 className="w-3 h-3" />
-              <span>Reset</span>
-            </button>
+              <Zap className={`w-3 h-3 ${realtimeConnected ? 'text-amber-400 animate-pulse' : ''}`} />
+              <span>{realtimeConnected ? 'SSE Live Stream Active' : 'Connecting Stream...'}</span>
+            </span>
           </div>
         </div>
       </section>
 
       {/* Main Content Area */}
       <main className="flex-1 max-w-7xl mx-auto w-full px-4 lg:px-8 py-6">
-        {activeTab === 'simulator' && (
-          <DiscordSimulator
-            onEventTriggered={fetchStatus}
-            config={{
-              xpVerification: statusData?.config?.xpVerification ?? 100,
-              xpReferral: statusData?.config?.xpReferral ?? 250,
-            }}
-          />
+        {activeTab === 'members' && (
+          <MembersView onRefreshAll={fetchStatus} spreadsheetUrl={spreadsheetUrl} />
         )}
+
+        {activeTab === 'referrals' && <ReferralsView onRefreshAll={fetchStatus} />}
+
+        {activeTab === 'invites' && <InvitesView onRefreshAll={fetchStatus} />}
+
+        {activeTab === 'sheets' && <GoogleSheetsHub onRefreshAll={fetchStatus} />}
+
+        {activeTab === 'commands' && <CommandsGuideView />}
 
         {activeTab === 'leaderboard' && <LeaderboardView />}
 
         {activeTab === 'ledger' && <LedgerView />}
 
-        {activeTab === 'referrals' && <ReferralsView />}
-
         {activeTab === 'logs' && <BotLogsView />}
-
-        {activeTab === 'setup' && <SetupGuideView />}
       </main>
 
-      {/* Clean Quiet Footer */}
+      {/* Quiet Footer */}
       <footer className="border-t border-slate-800/80 bg-[#0d111a] px-4 lg:px-8 py-4 text-xs text-slate-500">
         <div className="max-w-7xl mx-auto flex flex-col sm:flex-row items-center justify-between gap-2">
           <div>
-            <span>UPRISE Discord Bot Engine · MVP Specification</span>
+            <span className="text-slate-400 font-medium">UPRISE Discord Community Platform</span>
             <span className="mx-2 text-slate-700">·</span>
-            <span>Prisma ORM with SQLite Local Storage</span>
+            <span>Real-time Multi-Role Ledger & Verification Engine</span>
           </div>
 
           <div className="flex items-center gap-4 text-slate-400">
-            <span>Invite Tracking</span>
+            <span>Google Sheets Master Storage</span>
             <span aria-hidden="true">·</span>
-            <span>Verification Gateway</span>
+            <span>Gmail OTP Delivery</span>
             <span aria-hidden="true">·</span>
-            <span>Auditable XP</span>
+            <span>Discord Live Gateway</span>
           </div>
         </div>
       </footer>

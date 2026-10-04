@@ -14,23 +14,39 @@ export interface VerifyResult {
   inviteeUsername: string;
   inviterUsername?: string | null;
   inviteCode?: string | null;
+  fullName?: string | null;
+  email?: string | null;
 }
 
 export class VerificationService {
   /**
    * Main verification pipeline.
-   * Can be executed by Discord button interaction, /verify slash command, or web simulator.
+   * Can be executed by Discord button interaction, /verify slash command, or web verification modal.
    * Fully idempotent: will never award XP twice if executed multiple times.
    */
   public static async verifyMember(params: {
     discordId: string;
     username: string;
+    fullName?: string | null;
+    email?: string | null;
     guildMember?: GuildMember | null;
+    googleAccessToken?: string | null;
   }): Promise<VerifyResult> {
-    const { discordId, username, guildMember } = params;
+    const { discordId, username, fullName, email, guildMember, googleAccessToken } = params;
 
     // 1. Ensure user exists in database
     const user = await XpService.getOrCreateUser(discordId, username);
+
+    // Save provided full name and email
+    if (fullName || email) {
+      await prisma.user.update({
+        where: { id: user.id },
+        data: {
+          fullName: fullName || user.fullName,
+          email: email || user.email,
+        },
+      });
+    }
 
     // 2. Check if already verified in database (idempotency check)
     // We check if the user has an existing NEW_MEMBER_VERIFICATION XPTransaction
@@ -53,6 +69,8 @@ export class VerificationService {
         inviteeXpAwarded: 0,
         inviterXpAwarded: 0,
         inviteeUsername: user.username,
+        fullName: user.fullName,
+        email: user.email,
       };
     }
 
@@ -157,6 +175,12 @@ export class VerificationService {
       }
     }
 
+    // Update verifiedAt on user
+    await prisma.user.update({
+      where: { id: user.id },
+      data: { verifiedAt: now },
+    });
+
     // 6. Manage Discord Roles
     await this.syncDiscordRoles(guildMember);
 
@@ -180,6 +204,32 @@ export class VerificationService {
     // 8. Auto-update the official leaderboard channel
     LeaderboardService.updateChannelLeaderboard(Logger.getDiscordClient()).catch(() => {});
 
+    // 9. Sync row to Google Sheet if access token & spreadsheetId are present
+    if (googleAccessToken) {
+      try {
+        const sheetSetting = await prisma.systemSetting.findUnique({
+          where: { key: 'google_spreadsheet_id' },
+        });
+        if (sheetSetting?.value) {
+          const { GoogleWorkspaceService } = await import('./googleWorkspaceService.ts');
+          await GoogleWorkspaceService.appendVerifiedMember(googleAccessToken, sheetSetting.value, {
+            verifiedAt: now.toISOString(),
+            fullName: fullName || user.fullName || '',
+            email: email || user.email || '',
+            username: user.username,
+            discordId: user.discordId,
+            inviterUsername: inviterUsername || 'Direct',
+            inviterDiscordId: referral?.inviter?.discordId || '',
+            inviteCode: inviteCode || '',
+            xpEarned: inviteeXpAwarded,
+            status: 'VERIFIED',
+          });
+        }
+      } catch (err: any) {
+        console.warn('[VerificationService] Google Sheet append warning:', err.message);
+      }
+    }
+
     return {
       success: true,
       alreadyVerified: false,
@@ -189,6 +239,8 @@ export class VerificationService {
       inviteeUsername: user.username,
       inviterUsername,
       inviteCode,
+      fullName: fullName || user.fullName,
+      email: email || user.email,
     };
   }
 

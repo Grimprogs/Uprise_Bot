@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
-    "build": "vite build",
+    "build": "prisma generate && prisma db push && vite build",
     "start": "node server.ts",
     "bot": "tsx src/index.ts",
     "deploy-commands": "tsx scripts/deploy-commands.ts",
@@ -21,6 +21,7 @@
     "discord.js": "^14.27.0",
     "dotenv": "^17.2.3",
     "express": "^4.21.2",
+    "firebase": "^12.19.0",
     "lucide-react": "^0.546.0",
     "motion": "^12.23.24",
     "react": "^19.0.1",

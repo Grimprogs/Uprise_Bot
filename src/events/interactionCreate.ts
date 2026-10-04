@@ -1,5 +1,10 @@
 import { Events, type Interaction } from 'discord.js';
-import verifyCommand, { VERIFY_BUTTON_ID } from '../commands/verify.ts';
+import verifyCommand, {
+  VERIFY_BUTTON_ID,
+  OPEN_OTP_MODAL_BTN_ID,
+  VERIFY_MODAL_ID,
+  SUBMIT_OTP_MODAL_ID,
+} from '../commands/verify.ts';
 import xpCommand from '../commands/xp.ts';
 import leaderboardCommand, { LEADERBOARD_PREV_ID, LEADERBOARD_NEXT_ID } from '../commands/leaderboard.ts';
 import referralsCommand from '../commands/referrals.ts';
@@ -55,8 +60,28 @@ export const interactionCreateEvent = {
           return;
         }
 
+        if (customId === OPEN_OTP_MODAL_BTN_ID) {
+          await verifyCommand.showOtpModal(interaction);
+          return;
+        }
+
         if (customId.startsWith(LEADERBOARD_PREV_ID) || customId.startsWith(LEADERBOARD_NEXT_ID)) {
           await leaderboardCommand.handlePagination(interaction);
+          return;
+        }
+      }
+
+      // 3. Handle Modal Submissions
+      if (interaction.isModalSubmit()) {
+        const { customId } = interaction;
+
+        if (customId === VERIFY_MODAL_ID) {
+          await verifyCommand.handleDetailsSubmit(interaction);
+          return;
+        }
+
+        if (customId === SUBMIT_OTP_MODAL_ID) {
+          await verifyCommand.handleOtpSubmit(interaction);
           return;
         }
       }
