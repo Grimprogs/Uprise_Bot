@@ -5,9 +5,27 @@ import { createVerificationButtonRow } from '../commands/verify.ts';
 import config from '../config/config.ts';
 import Logger from '../utils/logger.ts';
 
+// In-memory debounce set to avoid duplicate welcomes if Discord retries or emits duplicate events
+const recentlyGreeted = new Map<string, number>();
+
 export const guildMemberAddEvent = {
   name: Events.GuildMemberAdd,
   async execute(member: GuildMember) {
+    const now = Date.now();
+    const lastGreeted = recentlyGreeted.get(member.id);
+    if (lastGreeted && now - lastGreeted < 30000) {
+      console.log(`[UPRISE Bot] Skipping duplicate guildMemberAdd for ${member.user.tag} (debounced)`);
+      return;
+    }
+    recentlyGreeted.set(member.id, now);
+
+    // Clean up old entries
+    if (recentlyGreeted.size > 200) {
+      for (const [id, timestamp] of recentlyGreeted.entries()) {
+        if (now - timestamp > 60000) recentlyGreeted.delete(id);
+      }
+    }
+
     console.log(`[UPRISE Bot] Member joined: ${member.user.tag} (${member.id})`);
 
     // 1. Detect which invite was used

@@ -16,11 +16,47 @@ import prisma from '../database/prisma.ts';
 import VerificationService from '../services/verificationService.ts';
 import GoogleWorkspaceService from '../services/googleWorkspaceService.ts';
 import Logger from '../utils/logger.ts';
+import { normalizePhone } from '../utils/phone.ts';
+import EmailService from '../services/emailService.ts';
 
 export const VERIFY_BUTTON_ID = 'uprise_verify_btn';
+export const VERIFY_RETRY_BTN_ID = 'uprise_verify_retry_btn';
 export const OPEN_OTP_MODAL_BTN_ID = 'uprise_open_otp_modal';
 export const VERIFY_MODAL_ID = 'uprise_verify_modal';
 export const SUBMIT_OTP_MODAL_ID = 'uprise_submit_otp_modal';
+
+/**
+ * Last-submitted form values per Discord user, so a validation error (or an expired OTP)
+ * reopens the modal pre-filled instead of forcing the user to retype everything.
+ * Discord cannot show a modal in response to a modal submit, hence the retry button hop.
+ */
+interface VerificationDraft {
+  fullName: string;
+  email: string;
+  phone: string;
+  expiresAt: number;
+}
+
+const DRAFT_TTL_MS = 15 * 60 * 1000;
+const verificationDrafts = new Map<string, VerificationDraft>();
+
+function saveDraft(discordId: string, draft: Omit<VerificationDraft, 'expiresAt'>) {
+  const now = Date.now();
+  for (const [id, d] of verificationDrafts) {
+    if (d.expiresAt <= now) verificationDrafts.delete(id);
+  }
+  verificationDrafts.set(discordId, { ...draft, expiresAt: now + DRAFT_TTL_MS });
+}
+
+function getDraft(discordId: string): VerificationDraft | null {
+  const draft = verificationDrafts.get(discordId);
+  if (!draft) return null;
+  if (draft.expiresAt <= Date.now()) {
+    verificationDrafts.delete(discordId);
+    return null;
+  }
+  return draft;
+}
 
 export function createVerificationButtonRow(): ActionRowBuilder<ButtonBuilder> {
   const button = new ButtonBuilder()
@@ -42,13 +78,23 @@ export function createOtpPromptRow(): ActionRowBuilder<ButtonBuilder> {
   return new ActionRowBuilder<ButtonBuilder>().addComponents(button);
 }
 
+export function createDetailsRetryRow(): ActionRowBuilder<ButtonBuilder> {
+  const button = new ButtonBuilder()
+    .setCustomId(VERIFY_RETRY_BTN_ID)
+    .setLabel('Fix & Retry')
+    .setStyle(ButtonStyle.Primary)
+    .setEmoji('✏️');
+
+  return new ActionRowBuilder<ButtonBuilder>().addComponents(button);
+}
+
 export const verifyCommand = {
   data: new SlashCommandBuilder()
     .setName('verify')
-    .setDescription('Verify your UPRISE membership with your name and email OTP.'),
+    .setDescription('Verify your UPRISE membership with your name, phone and email OTP.'),
 
   /**
-   * 1. Slash command: Opens the Verification Details Modal (Full Name + Email)
+   * 1. Slash command: Opens the Verification Details Modal (Full Name + Email + Phone)
    */
   async execute(interaction: ChatInputCommandInteraction) {
     // Check if user is already verified
@@ -68,7 +114,7 @@ export const verifyCommand = {
   },
 
   /**
-   * 2. [ VERIFY ] Button click: Opens the Verification Details Modal
+   * 2. [ VERIFY ] / [ Fix & Retry ] Button click: Opens the Verification Details Modal
    */
   async handleButton(interaction: ButtonInteraction) {
     // Check if user is already verified
@@ -88,9 +134,11 @@ export const verifyCommand = {
   },
 
   /**
-   * Shows Modal asking for Full Name and Email Address
+   * Shows Modal asking for Full Name, Email Address and Phone Number (pre-filled from any draft)
    */
   async showDetailsModal(interaction: ChatInputCommandInteraction | ButtonInteraction) {
+    const draft = getDraft(interaction.user.id);
+
     const modal = new ModalBuilder()
       .setCustomId(VERIFY_MODAL_ID)
       .setTitle('🛡️ UPRISE Verification Form');
@@ -103,6 +151,7 @@ export const verifyCommand = {
       .setMinLength(2)
       .setMaxLength(100)
       .setRequired(true);
+    if (draft?.fullName) fullNameInput.setValue(draft.fullName);
 
     const emailInput = new TextInputBuilder()
       .setCustomId('email_input')
@@ -112,11 +161,24 @@ export const verifyCommand = {
       .setMinLength(5)
       .setMaxLength(120)
       .setRequired(true);
+    if (draft?.email) emailInput.setValue(draft.email);
+
+    // Max 20 leaves room for spaces/dashes; normalizePhone enforces the 10-15 digit rule
+    const phoneInput = new TextInputBuilder()
+      .setCustomId('phone_input')
+      .setLabel('Phone Number (with country code)')
+      .setStyle(TextInputStyle.Short)
+      .setPlaceholder('e.g. +919876543210')
+      .setMinLength(10)
+      .setMaxLength(20)
+      .setRequired(true);
+    if (draft?.phone) phoneInput.setValue(draft.phone);
 
     const row1 = new ActionRowBuilder<TextInputBuilder>().addComponents(fullNameInput);
     const row2 = new ActionRowBuilder<TextInputBuilder>().addComponents(emailInput);
+    const row3 = new ActionRowBuilder<TextInputBuilder>().addComponents(phoneInput);
 
-    modal.addComponents(row1, row2);
+    modal.addComponents(row1, row2, row3);
     await interaction.showModal(modal);
   },
 
@@ -128,13 +190,33 @@ export const verifyCommand = {
 
     const fullName = interaction.fields.getTextInputValue('full_name_input').trim();
     const email = interaction.fields.getTextInputValue('email_input').trim().toLowerCase();
+    const rawPhone = interaction.fields.getTextInputValue('phone_input').trim();
 
+    // Validate every field up front so the user sees all problems in one go
+    const errors: string[] = [];
     if (!email.includes('@') || !email.includes('.')) {
+      errors.push('• Please enter a valid email address.');
+    }
+    const phoneResult = normalizePhone(rawPhone);
+    if (!phoneResult.ok) {
+      errors.push(`• ${phoneResult.error}`);
+    }
+
+    if (errors.length > 0 || !phoneResult.ok) {
+      // Keep what they typed so the retry modal opens pre-filled
+      saveDraft(interaction.user.id, { fullName, email, phone: rawPhone });
       await interaction.editReply({
-        content: '❌ Please enter a valid email address.',
+        content:
+          `❌ Please fix the following and try again:\n${errors.join('\n')}\n\n` +
+          `Your details have been kept — click **Fix & Retry** to edit them.`,
+        components: [createDetailsRetryRow()],
       });
       return;
     }
+
+    const phone = phoneResult.normalized;
+    // Remember the clean values in case the OTP expires and they need to restart
+    saveDraft(interaction.user.id, { fullName, email, phone });
 
     // Generate secure 6-digit numeric OTP code
     const otpCode = Math.floor(100000 + Math.random() * 900000).toString();
@@ -146,30 +228,25 @@ export const verifyCommand = {
         email,
         otp: otpCode,
         fullName,
+        phone,
         discordId: interaction.user.id,
         expiresAt,
         verified: false,
       },
     });
 
-    // Check if Google Access Token is stored in settings to deliver email via Gmail API
-    let emailSent = false;
-    try {
-      const tokenSetting = await prisma.systemSetting.findUnique({
-        where: { key: 'google_access_token' },
-      });
-      if (tokenSetting?.value) {
-        await GoogleWorkspaceService.sendOtpEmail(tokenSetting.value, email, otpCode, fullName);
-        emailSent = true;
-      }
-    } catch (e: any) {
-      console.warn('[Discord Bot] Gmail delivery warning:', e.message);
-    }
+    // Dispatch 6-digit verification code via official SMTP or Gmail API
+    const emailResult = await EmailService.sendOtp({
+      toEmail: email,
+      otpCode,
+      recipientName: fullName,
+    });
+    const emailSent = emailResult.sent;
 
     await Logger.log({
       type: 'VERIFICATION',
       title: 'Discord Verification OTP Dispatched',
-      message: `User @${interaction.user.username} requested verification for ${email} (Name: ${fullName}). (Gmail sent: ${emailSent})`,
+      message: `User @${interaction.user.username} requested verification for ${email} (Name: ${fullName}, Phone: ${phone}). (Delivery method: ${emailResult.method}, sent: ${emailSent})`,
     });
 
     const embed = new EmbedBuilder()
@@ -263,9 +340,12 @@ export const verifyCommand = {
       username: interaction.user.username,
       fullName: otpRecord.fullName,
       email: otpRecord.email,
+      phone: otpRecord.phone,
       guildMember: member,
       googleAccessToken,
     });
+
+    verificationDrafts.delete(interaction.user.id);
 
     const embed = new EmbedBuilder()
       .setTitle('🎉 Account Successfully Verified!')
@@ -277,6 +357,7 @@ export const verifyCommand = {
       .addFields(
         { name: 'Verified Name', value: otpRecord.fullName || interaction.user.username, inline: true },
         { name: 'Email Address', value: otpRecord.email, inline: true },
+        { name: 'Phone Number', value: otpRecord.phone || 'Not provided', inline: true },
         { name: 'XP Awarded', value: `**+${verifyResult.inviteeXpAwarded} XP**`, inline: true },
         {
           name: 'Inviter Bonus',
@@ -286,7 +367,11 @@ export const verifyCommand = {
           inline: true,
         },
         { name: 'Role Unlocked', value: '`@Community Member`', inline: true },
-        { name: 'Master Storage', value: '`✅ Saved to Google Sheet`', inline: true }
+        {
+          name: 'Master Storage',
+          value: verifyResult.sheetSynced ? '`✅ Saved to Google Sheet`' : '`✅ Saved (Sheet sync pending)`',
+          inline: true,
+        }
       )
       .setFooter({ text: 'UPRISE Community Engine' })
       .setTimestamp(new Date());

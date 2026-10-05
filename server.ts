@@ -12,6 +12,9 @@ import LeaderboardService from './src/services/leaderboardService.ts';
 import InviteService from './src/services/inviteService.ts';
 import GoogleWorkspaceService from './src/services/googleWorkspaceService.ts';
 import Logger from './src/utils/logger.ts';
+import { normalizePhone } from './src/utils/phone.ts';
+import EmailService from './src/services/emailService.ts';
+import EventChannelService from './src/services/eventChannelService.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -66,6 +69,7 @@ async function startServer() {
       res.json({
         ok: true,
         botOnline: isBotOnline(),
+        botDisabled: config.botDisabled,
         botUser: client?.user ? { tag: client.user.tag, id: client.user.id } : null,
         discordConfigured: isDiscordConfigured(),
         guilds: client ? Array.from(client.guilds.cache.values()).map(g => ({ id: g.id, name: g.name, memberCount: g.memberCount })) : [],
@@ -214,6 +218,34 @@ async function startServer() {
       await LeaderboardService.updateChannelLeaderboard(client);
 
       res.json({ ok: true, message: `Leaderboard updated in #${(channel as any).name}` });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // Stop Discord Bot Gateway on this cloud server (allows running on local PC without token conflict)
+  app.post('/api/bot/stop', async (_req, res) => {
+    try {
+      config.botDisabled = true;
+      process.env.DISABLE_DISCORD_BOT = 'true';
+      await stopDiscordBot();
+      broadcastRealtimeEvent('BOT_STATUS', { botOnline: false, botDisabled: true });
+      console.log('[UPRISE Server] Discord bot gateway stopped successfully on cloud instance.');
+      res.json({ ok: true, message: 'Discord bot gateway stopped on cloud server. Free to run on your PC.' });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // Start Discord Bot Gateway on this cloud server
+  app.post('/api/bot/start', async (_req, res) => {
+    try {
+      config.botDisabled = false;
+      delete process.env.DISABLE_DISCORD_BOT;
+      await startDiscordBot();
+      broadcastRealtimeEvent('BOT_STATUS', { botOnline: isBotOnline(), botDisabled: false });
+      console.log('[UPRISE Server] Discord bot gateway started on cloud instance.');
+      res.json({ ok: true, message: 'Discord bot gateway started on cloud server.' });
     } catch (err: any) {
       res.status(500).json({ error: err.message });
     }
@@ -743,13 +775,199 @@ async function startServer() {
     }
   });
 
+  // 4b. Official Email SMTP Management (Google App Passwords)
+  app.get('/api/email/smtp-status', async (_req, res) => {
+    try {
+      const creds = await EmailService.getSmtpCredentials();
+      if (!creds) {
+        return res.json({ configured: false, user: null });
+      }
+      // Mask email for security display (e.g., of***@gmail.com)
+      const parts = creds.user.split('@');
+      const masked = parts[0].length > 2
+        ? `${parts[0].slice(0, 2)}***@${parts[1] || ''}`
+        : `${parts[0]}***@${parts[1] || ''}`;
+
+      res.json({
+        configured: true,
+        user: creds.user,
+        maskedUser: masked,
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.post('/api/email/smtp-save', async (req, res) => {
+    try {
+      const { user, pass } = req.body;
+      if (!user || !user.includes('@')) {
+        return res.status(400).json({ error: 'Valid Gmail address is required' });
+      }
+      if (!pass || pass.replace(/\s+/g, '').length < 8) {
+        return res.status(400).json({ error: 'Valid Google App Password (16 characters) is required' });
+      }
+
+      const cleanPass = pass.replace(/\s+/g, '');
+      const cleanUser = user.trim().toLowerCase();
+
+      // Save in SQLite database system settings
+      await prisma.systemSetting.upsert({
+        where: { key: 'smtp_email' },
+        update: { value: cleanUser },
+        create: { key: 'smtp_email', value: cleanUser },
+      });
+
+      await prisma.systemSetting.upsert({
+        where: { key: 'smtp_pass' },
+        update: { value: cleanPass },
+        create: { key: 'smtp_pass', value: cleanPass },
+      });
+
+      // Also set in environment variables for current process
+      process.env.SMTP_USER = cleanUser;
+      process.env.SMTP_PASS = cleanPass;
+
+      res.json({
+        ok: true,
+        message: `Official Gmail SMTP successfully configured for ${cleanUser}!`,
+        user: cleanUser,
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.post('/api/email/test-send', async (req, res) => {
+    try {
+      const { toEmail } = req.body;
+      if (!toEmail || !toEmail.includes('@')) {
+        return res.status(400).json({ error: 'Valid recipient email address is required' });
+      }
+
+      const testOtp = Math.floor(100000 + Math.random() * 900000).toString();
+      const result = await EmailService.sendOtp({
+        toEmail,
+        otpCode: testOtp,
+        recipientName: 'Community Administrator',
+      });
+
+      if (!result.sent) {
+        return res.status(400).json({
+          ok: false,
+          error: result.error || 'Failed to dispatch email. Please check your App Password.',
+          method: result.method,
+        });
+      }
+
+      res.json({
+        ok: true,
+        message: `Test email successfully dispatched to ${toEmail} using ${result.method}!`,
+        method: result.method,
+        testOtp,
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // 4c. Event Management & Reminders API
+  app.get('/api/scheduled-events', async (_req, res) => {
+    try {
+      const events = await prisma.scheduledEventChannel.findMany({
+        orderBy: [{ status: 'asc' }, { startTime: 'asc' }],
+        take: 50,
+      });
+
+      const client = getBotClient();
+      const enriched = events.map((e) => {
+        let channelName = e.name;
+        let attendeesCount = 0;
+        if (client && config.discordGuildId) {
+          const guild = client.guilds.cache.get(config.discordGuildId);
+          if (guild) {
+            const ch = guild.channels.cache.get(e.channelId);
+            if (ch && ch.isVoiceBased()) {
+              channelName = ch.name;
+              attendeesCount = ch.members.size;
+            }
+          }
+        }
+        return {
+          ...e,
+          channelName,
+          attendeesCount,
+        };
+      });
+
+      res.json({ ok: true, events: enriched });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // Manually trigger an immediate @everyone reminder for an event
+  app.post('/api/scheduled-events/:id/remind', async (req, res) => {
+    try {
+      const { id } = req.params;
+      const event = await prisma.scheduledEventChannel.findUnique({ where: { id } });
+      if (!event) return res.status(404).json({ error: 'Event not found' });
+
+      const client = getBotClient();
+      if (!client || !client.isReady()) {
+        return res.status(503).json({ error: 'Discord bot is not currently online' });
+      }
+
+      await EventChannelService.sendReminder(client, event, 'MANUAL');
+      broadcastRealtimeEvent('EVENT_REMINDER_SENT', { id, name: event.name });
+
+      res.json({ ok: true, message: `@everyone reminder dispatched for ${event.name}!` });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // Cancel an event and delete its voice channel
+  app.post('/api/scheduled-events/:id/cancel', async (req, res) => {
+    try {
+      const { id } = req.params;
+      const event = await prisma.scheduledEventChannel.findUnique({ where: { id } });
+      if (!event) return res.status(404).json({ error: 'Event not found' });
+
+      const client = getBotClient();
+      if (client && client.isReady()) {
+        await EventChannelService.cancelEvent(client, event, 'Dashboard Administrator');
+      } else {
+        await prisma.scheduledEventChannel.update({
+          where: { id },
+          data: { status: 'CANCELLED', endedAt: new Date() },
+        });
+      }
+
+      broadcastRealtimeEvent('EVENT_CANCELLED', { id, name: event.name });
+      res.json({ ok: true, message: `Event ${event.name} cancelled successfully.` });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // 8. VERIFICATION FORM & EMAIL OTP WORKFLOW
   // Send OTP
   app.post('/api/verify/send-otp', async (req, res) => {
     try {
-      const { email, fullName, discordId, username } = req.body;
+      const { email, fullName, discordId, username, phone } = req.body;
       if (!email || !email.includes('@')) {
         return res.status(400).json({ error: 'Valid email address is required' });
+      }
+
+      // Member verification forms always send `phone`; the Gmail test button omits it
+      let normalizedPhone: string | null = null;
+      if (phone !== undefined) {
+        const phoneResult = normalizePhone(phone);
+        if (!phoneResult.ok) {
+          return res.status(400).json({ error: phoneResult.error });
+        }
+        normalizedPhone = phoneResult.normalized;
       }
 
       // Generate secure 6-digit numeric OTP code
@@ -762,43 +980,36 @@ async function startServer() {
           email,
           otp: otpCode,
           fullName: fullName || null,
+          phone: normalizedPhone,
           discordId: discordId || null,
           expiresAt,
           verified: false,
         },
       });
 
-      // If client provided Google access token via Authorization header, send email via Gmail API!
-      const authHeader = req.headers.authorization;
-      let emailSent = false;
-      let gmailError = null;
-
-      if (authHeader && authHeader.startsWith('Bearer ')) {
-        const token = authHeader.substring(7);
-        try {
-          await GoogleWorkspaceService.sendOtpEmail(token, email, otpCode, fullName);
-          emailSent = true;
-        } catch (e: any) {
-          gmailError = e.message;
-        }
-      }
+      // Dispatch 6-digit verification code via official SMTP or Gmail API
+      const emailResult = await EmailService.sendOtp({
+        toEmail: email,
+        otpCode,
+        recipientName: fullName || username || 'Member',
+      });
 
       await Logger.log({
         type: 'VERIFICATION',
         title: 'Verification OTP Generated',
-        message: `Sent OTP code to ${email} for @${username || discordId || 'New Member'}. (Email sent via Gmail: ${emailSent})`,
+        message: `Sent OTP code to ${email} for @${username || discordId || 'New Member'}. (Method: ${emailResult.method}, Sent: ${emailResult.sent})`,
       });
 
       res.json({
         ok: true,
-        message: emailSent
-          ? `Verification code successfully sent to ${email}!`
-          : `Verification code generated! (Enter code: ${otpCode})`,
+        message: emailResult.sent
+          ? `Verification code dispatched to ${email} via ${emailResult.method}!`
+          : `Verification code generated! (Dev preview code: ${otpCode})`,
         email,
-        emailSent,
-        // Provided for UI testing and immediate verification convenience
+        emailSent: emailResult.sent,
+        method: emailResult.method,
+        // Provided for UI testing convenience if email wasn't delivered
         otpPreview: otpCode,
-        gmailError,
       });
     } catch (err: any) {
       res.status(500).json({ error: err.message });
@@ -858,6 +1069,7 @@ async function startServer() {
         username: username || guildMember?.user?.username || `User_${discordId.slice(-4)}`,
         fullName: fullName || otpRecord.fullName || null,
         email,
+        phone: otpRecord.phone,
         guildMember,
         googleAccessToken,
       });
@@ -943,6 +1155,7 @@ async function startServer() {
         verifiedAt: u.verifiedAt ? u.verifiedAt.toISOString() : '',
         fullName: u.fullName || '',
         email: u.email || '',
+        phone: u.phone || '',
         username: u.username,
         discordId: u.discordId,
         inviterUsername: u.referralReceived?.inviter?.username || 'Direct',

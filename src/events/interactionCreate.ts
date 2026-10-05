@@ -1,6 +1,7 @@
 import { Events, type Interaction } from 'discord.js';
 import verifyCommand, {
   VERIFY_BUTTON_ID,
+  VERIFY_RETRY_BTN_ID,
   OPEN_OTP_MODAL_BTN_ID,
   VERIFY_MODAL_ID,
   SUBMIT_OTP_MODAL_ID,
@@ -10,6 +11,9 @@ import leaderboardCommand, { LEADERBOARD_PREV_ID, LEADERBOARD_NEXT_ID } from '..
 import referralsCommand from '../commands/referrals.ts';
 import adminXpCommand from '../commands/adminXp.ts';
 import adminReferralCommand from '../commands/adminReferral.ts';
+import vcCommand, { VC_PANEL_PREFIX } from '../commands/vc.ts';
+import eventVcCommand from '../commands/eventVc.ts';
+import clearCommand from '../commands/clear.ts';
 import ReferralService from '../services/referralService.ts';
 import Logger from '../utils/logger.ts';
 
@@ -45,6 +49,15 @@ export const interactionCreateEvent = {
           case 'admin-referral':
             await adminReferralCommand.execute(interaction);
             break;
+          case 'vc':
+            await vcCommand.execute(interaction);
+            break;
+          case 'event-vc':
+            await eventVcCommand.execute(interaction);
+            break;
+          case 'clear':
+            await clearCommand.execute(interaction);
+            break;
           default:
             console.warn(`[UPRISE Bot] Unknown command received: ${commandName}`);
         }
@@ -55,7 +68,11 @@ export const interactionCreateEvent = {
       if (interaction.isButton()) {
         const { customId } = interaction;
 
-        if (customId === VERIFY_BUTTON_ID) {
+        if (
+          customId === VERIFY_BUTTON_ID ||
+          customId === VERIFY_RETRY_BTN_ID ||
+          customId === 'uprise_start_verification_btn'
+        ) {
           await verifyCommand.handleButton(interaction);
           return;
         }
@@ -69,6 +86,17 @@ export const interactionCreateEvent = {
           await leaderboardCommand.handlePagination(interaction);
           return;
         }
+
+        if (customId.startsWith(VC_PANEL_PREFIX)) {
+          await vcCommand.handleComponent(interaction);
+          return;
+        }
+      }
+
+      // 2b. Handle User Select Menus (voice channel control panel)
+      if (interaction.isUserSelectMenu() && interaction.customId.startsWith(VC_PANEL_PREFIX)) {
+        await vcCommand.handleComponent(interaction);
+        return;
       }
 
       // 3. Handle Modal Submissions
@@ -82,6 +110,11 @@ export const interactionCreateEvent = {
 
         if (customId === SUBMIT_OTP_MODAL_ID) {
           await verifyCommand.handleOtpSubmit(interaction);
+          return;
+        }
+
+        if (customId.startsWith(VC_PANEL_PREFIX)) {
+          await vcCommand.handleComponent(interaction);
           return;
         }
       }

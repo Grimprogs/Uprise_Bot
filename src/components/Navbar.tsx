@@ -12,15 +12,18 @@ import {
   Sparkles,
   Zap,
   Terminal,
+  Calendar,
 } from 'lucide-react';
 import { auth, googleSignIn, googleLogout, initAuth } from '../services/firebaseAuth.ts';
 
-export type TabType = 'members' | 'referrals' | 'invites' | 'sheets' | 'commands' | 'leaderboard' | 'ledger' | 'logs';
+export type TabType = 'members' | 'referrals' | 'events' | 'invites' | 'sheets' | 'commands' | 'leaderboard' | 'ledger' | 'logs';
 
 interface NavbarProps {
   activeTab: TabType;
   setActiveTab: (tab: TabType) => void;
   botOnline: boolean;
+  botDisabled?: boolean;
+  onToggleBot?: () => void;
   onRefresh: () => void;
   isRefreshing: boolean;
   realtimeConnected: boolean;
@@ -30,6 +33,8 @@ export const Navbar: React.FC<NavbarProps> = ({
   activeTab,
   setActiveTab,
   botOnline,
+  botDisabled,
+  onToggleBot,
   onRefresh,
   isRefreshing,
   realtimeConnected,
@@ -83,6 +88,18 @@ export const Navbar: React.FC<NavbarProps> = ({
           >
             <UserCheck className="w-3.5 h-3.5" />
             <span>Referrals (CRUD)</span>
+          </button>
+
+          <button
+            onClick={() => setActiveTab('events')}
+            className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${
+              activeTab === 'events'
+                ? 'bg-amber-950/60 border border-amber-800/80 text-amber-300 shadow-xs'
+                : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/50'
+            }`}
+          >
+            <Calendar className="w-3.5 h-3.5 text-amber-400" />
+            <span>Events & Reminders</span>
           </button>
 
           <button
@@ -166,17 +183,37 @@ export const Navbar: React.FC<NavbarProps> = ({
             <span className="hidden sm:inline">Real-Time Sync</span>
           </div>
 
-          {/* Discord Bot Status */}
-          <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-slate-900 border border-slate-800 text-[11px]">
+          {/* Discord Bot Status / Control */}
+          <button
+            onClick={onToggleBot}
+            title={
+              botDisabled
+                ? "Bot is paused on cloud server (Safe for running on PC). Click to resume on cloud."
+                : botOnline
+                ? "Bot is live on cloud server. Click to stop cloud bot if running on PC."
+                : "Bot is offline. Click to start."
+            }
+            className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md border text-[11px] transition-colors cursor-pointer ${
+              botDisabled
+                ? 'bg-amber-500/10 hover:bg-amber-500/20 border-amber-500/30 text-amber-300'
+                : botOnline
+                ? 'bg-emerald-500/10 hover:bg-emerald-500/20 border-emerald-500/30 text-emerald-300'
+                : 'bg-slate-900 hover:bg-slate-800 border-slate-800 text-slate-400'
+            }`}
+          >
             <span
               className={`w-2 h-2 rounded-full ${
-                botOnline ? 'bg-emerald-500 animate-pulse' : 'bg-slate-600'
+                botDisabled
+                  ? 'bg-amber-400'
+                  : botOnline
+                  ? 'bg-emerald-400 animate-pulse'
+                  : 'bg-slate-600'
               }`}
             />
-            <span className="text-slate-400 hidden sm:inline">
-              {botOnline ? 'Discord Bot Live' : 'Bot Offline'}
+            <span className="hidden sm:inline font-medium">
+              {botDisabled ? 'Bot Paused (PC Mode)' : botOnline ? 'Cloud Bot Live' : 'Bot Offline'}
             </span>
-          </div>
+          </button>
 
           {/* Google Auth Status Badge */}
           {currentUser ? (

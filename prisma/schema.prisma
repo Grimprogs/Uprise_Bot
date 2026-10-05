@@ -16,6 +16,7 @@ model User {
   username    String
   email       String?
   fullName    String?
+  phone       String?
   verifiedAt  DateTime?
   xp          Int      @default(0)
   createdAt   DateTime @default(now())
@@ -79,6 +80,7 @@ model OTPVerification {
   otp       String
   discordId String?
   fullName  String?
+  phone     String?
   expiresAt DateTime
   verified  Boolean  @default(false)
   createdAt DateTime @default(now())
@@ -90,3 +92,43 @@ model SystemSetting {
   updatedAt DateTime @updatedAt
 }
 
+
+// Member-owned temporary voice channels ("Join-to-Create" hub or /vc create).
+// Deleted automatically once the last human leaves.
+model DynamicVoiceChannel {
+  id        String   @id @default(cuid())
+  guildId   String
+  channelId String   @unique
+  ownerId   String
+  createdAt DateTime @default(now())
+
+  // A member can own at most one dynamic channel per guild (also blocks double-create races)
+  @@unique([guildId, ownerId])
+}
+
+// Event voice channels that are created locked and unlock automatically at startTime.
+model ScheduledEventChannel {
+  id                String    @id @default(cuid())
+  guildId           String
+  channelId         String    @unique
+  name              String
+  startTime         DateTime
+  endTime           DateTime? // null = event ends once the channel empties after opening
+  status            String    @default("PENDING") // PENDING, ACTIVE, ENDED, CANCELLED
+  creatorId         String
+  userLimit         Int       @default(0)
+  hidden            Boolean   @default(false)
+  description       String?
+  reminded1h        Boolean   @default(false)
+  reminded15m       Boolean   @default(false)
+  announceChannelId String?
+  pingRoleId        String?
+  openedAt          DateTime?
+  endedAt           DateTime?
+  channelDeletedAt  DateTime? // set once the Discord channel is gone, so sweeps can skip the row
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  @@index([status, startTime])
+  @@index([status, endTime])
+}

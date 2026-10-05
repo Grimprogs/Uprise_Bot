@@ -12,6 +12,7 @@ import {
   LogOut,
   Database,
   ArrowRight,
+  KeyRound,
 } from 'lucide-react';
 import { googleSignIn, googleLogout, getAccessToken, initAuth, auth } from '../services/firebaseAuth.ts';
 
@@ -34,14 +35,58 @@ export const GoogleSheetsHub: React.FC<GoogleSheetsHubProps> = ({ onRefreshAll }
   const [isSendingTest, setIsSendingTest] = useState(false);
   const [testResult, setTestResult] = useState<string | null>(null);
 
-  // Load settings
+  // Official SMTP / App Password state
+  const [smtpStatus, setSmtpStatus] = useState<{ configured: boolean; user: string | null; maskedUser: string | null }>({
+    configured: false,
+    user: null,
+    maskedUser: null,
+  });
+  const [smtpUser, setSmtpUser] = useState('');
+  const [smtpPass, setSmtpPass] = useState('');
+  const [isSavingSmtp, setIsSavingSmtp] = useState(false);
+  const [smtpFeedback, setSmtpFeedback] = useState<string | null>(null);
+
+  // Load settings & SMTP status
   const fetchSettings = async () => {
     try {
-      const res = await fetch('/api/settings');
-      const data = await res.json();
+      const [settingsRes, smtpRes] = await Promise.all([
+        fetch('/api/settings'),
+        fetch('/api/email/smtp-status'),
+      ]);
+      const data = await settingsRes.json();
+      const sData = await smtpRes.json();
       setSettings(data);
+      setSmtpStatus(sData);
+      if (sData.user) {
+        setSmtpUser(sData.user);
+      }
     } catch (e: any) {
       console.warn('Failed to fetch settings:', e.message);
+    }
+  };
+
+  const handleSaveSmtp = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!smtpUser || !smtpPass) return;
+    setIsSavingSmtp(true);
+    setSmtpFeedback(null);
+    try {
+      const res = await fetch('/api/email/smtp-save', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ user: smtpUser, pass: smtpPass }),
+      });
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        throw new Error(data.error || 'Failed to save SMTP settings');
+      }
+      setSmtpFeedback(`✅ Official email saved! Connected as ${data.user}.`);
+      setSmtpPass('');
+      await fetchSettings();
+    } catch (err: any) {
+      setSmtpFeedback(`❌ Error: ${err.message}`);
+    } finally {
+      setIsSavingSmtp(false);
     }
   };
 
@@ -328,7 +373,7 @@ export const GoogleSheetsHub: React.FC<GoogleSheetsHubProps> = ({ onRefreshAll }
             </div>
 
             <p className="text-xs text-slate-400 mb-5 leading-relaxed">
-              Every verified member is automatically saved to your linked Google Sheet with their verification timestamp, full name, email, Discord username, user ID, inviter details, and XP earned.
+              Every verified member is automatically saved to your linked Google Sheet with their verification timestamp, full name, email, phone number, Discord username, user ID, inviter details, and XP earned.
             </p>
 
             {spreadsheetId ? (
@@ -408,72 +453,133 @@ export const GoogleSheetsHub: React.FC<GoogleSheetsHubProps> = ({ onRefreshAll }
           </div>
         </div>
 
-        {/* Right Column: Gmail OTP Verification Delivery */}
-        <div className="bg-[#0e121b] border border-slate-800 rounded-xl p-6 flex flex-col justify-between">
+        {/* Right Column: Official Email & OTP Delivery Gateway */}
+        <div className="bg-[#0e121b] border border-slate-800 rounded-xl p-6 flex flex-col justify-between space-y-6">
           <div>
             <div className="flex items-center justify-between mb-4">
               <h3 className="text-base font-semibold text-white flex items-center gap-2">
                 <Mail className="w-4 h-4 text-indigo-400" />
-                Gmail OTP Delivery Gateway
+                Official Email OTP Delivery
               </h3>
-              <span className="px-2 py-0.5 rounded text-[11px] font-medium bg-indigo-950/40 border border-indigo-800 text-indigo-400">
-                Official Gmail API
+              <span className={`px-2 py-0.5 rounded text-[11px] font-medium border ${
+                smtpStatus.configured
+                  ? 'bg-emerald-950/40 border-emerald-800 text-emerald-400'
+                  : 'bg-amber-950/40 border-amber-800 text-amber-300'
+              }`}>
+                {smtpStatus.configured ? `SMTP Active: ${smtpStatus.maskedUser}` : 'SMTP Not Configured'}
               </span>
             </div>
 
-            <p className="text-xs text-slate-400 mb-5 leading-relaxed">
-              When members submit the verification form, a secure 6-digit OTP code is dispatched directly to their email inbox using your connected Gmail account. Test the delivery pipeline below:
-            </p>
-
-            <form onSubmit={handleSendTestOtp} className="space-y-3 mb-4">
-              <div>
-                <label className="block text-xs font-medium text-slate-300 mb-1">
-                  Recipient Full Name
-                </label>
-                <input
-                  type="text"
-                  placeholder="e.g. Anurag Gupta"
-                  value={testName}
-                  onChange={(e) => setTestName(e.target.value)}
-                  className="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-indigo-500"
-                />
+            {/* Official Google App Password Card */}
+            <div className="p-4 rounded-lg bg-slate-900/80 border border-slate-800 mb-5">
+              <div className="flex items-center gap-2 mb-2 text-xs font-semibold text-indigo-300">
+                <KeyRound className="w-3.5 h-3.5" />
+                <span>Official Mail Account (Permanent Background SMTP)</span>
               </div>
+              <p className="text-[11px] text-slate-400 mb-3 leading-relaxed">
+                Connect your community's official Gmail account using a <strong>16-character Google App Password</strong>. This runs 24/7 in the background with zero token expiry or sign-in needed!
+              </p>
 
-              <div>
-                <label className="block text-xs font-medium text-slate-300 mb-1">
-                  Recipient Email Address
-                </label>
-                <input
-                  type="email"
-                  required
-                  placeholder="e.g. user@example.com"
-                  value={testEmail}
-                  onChange={(e) => setTestEmail(e.target.value)}
-                  className="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-indigo-500"
-                />
-              </div>
+              <form onSubmit={handleSaveSmtp} className="space-y-3">
+                <div>
+                  <label className="block text-[11px] font-medium text-slate-300 mb-1">
+                    Official Sender Gmail Address
+                  </label>
+                  <input
+                    type="email"
+                    required
+                    placeholder="e.g. uprise.community@gmail.com"
+                    value={smtpUser}
+                    onChange={(e) => setSmtpUser(e.target.value)}
+                    className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-1.5 text-xs text-white placeholder-slate-600 focus:outline-none focus:border-indigo-500"
+                  />
+                </div>
 
-              <button
-                type="submit"
-                disabled={isSendingTest || !testEmail}
-                className="w-full px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium rounded-lg transition-colors flex items-center justify-center gap-2 disabled:opacity-50"
-              >
-                <Send className="w-3.5 h-3.5" />
-                <span>{isSendingTest ? 'Sending Test OTP...' : 'Send Test OTP via Gmail'}</span>
-              </button>
-            </form>
+                <div>
+                  <label className="block text-[11px] font-medium text-slate-300 mb-1">
+                    16-Character Google App Password
+                  </label>
+                  <input
+                    type="password"
+                    required
+                    placeholder="e.g. abcd efgh ijkl mnop"
+                    value={smtpPass}
+                    onChange={(e) => setSmtpPass(e.target.value)}
+                    className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-1.5 text-xs text-white placeholder-slate-600 focus:outline-none focus:border-indigo-500 font-mono"
+                  />
+                  <span className="text-[10px] text-slate-500 mt-1 block">
+                    Generate in your Google Account: Security → 2-Step Verification → App Passwords
+                  </span>
+                </div>
 
-            {testResult && (
-              <div className="p-3 bg-slate-900 border border-slate-800 rounded-lg text-xs font-mono text-slate-300">
-                {testResult}
-              </div>
-            )}
+                <button
+                  type="submit"
+                  disabled={isSavingSmtp || !smtpUser || !smtpPass}
+                  className="w-full px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold rounded-lg transition-colors flex items-center justify-center gap-1.5 disabled:opacity-50 cursor-pointer"
+                >
+                  <ShieldCheck className="w-3.5 h-3.5" />
+                  <span>{isSavingSmtp ? 'Saving...' : 'Save & Activate Official Mailer'}</span>
+                </button>
+              </form>
+
+              {smtpFeedback && (
+                <div className="mt-3 p-2.5 rounded bg-slate-950 border border-slate-800 text-xs font-mono text-slate-300">
+                  {smtpFeedback}
+                </div>
+              )}
+            </div>
+
+            {/* Test Email Dispatch Form */}
+            <div className="border-t border-slate-800/80 pt-4">
+              <h4 className="text-xs font-semibold text-slate-200 mb-1 flex items-center gap-1.5">
+                <Send className="w-3.5 h-3.5 text-slate-400" />
+                <span>Test OTP Mail Delivery</span>
+              </h4>
+              <p className="text-[11px] text-slate-400 mb-3">
+                Send a real test verification code to your email to verify inbox delivery:
+              </p>
+
+              <form onSubmit={handleSendTestOtp} className="space-y-3 mb-3">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  <input
+                    type="text"
+                    placeholder="Recipient Name"
+                    value={testName}
+                    onChange={(e) => setTestName(e.target.value)}
+                    className="bg-slate-900 border border-slate-800 rounded-lg px-3 py-1.5 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-indigo-500"
+                  />
+                  <input
+                    type="email"
+                    required
+                    placeholder="Your Email Address"
+                    value={testEmail}
+                    onChange={(e) => setTestEmail(e.target.value)}
+                    className="bg-slate-900 border border-slate-800 rounded-lg px-3 py-1.5 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-indigo-500"
+                  />
+                </div>
+
+                <button
+                  type="submit"
+                  disabled={isSendingTest || !testEmail}
+                  className="w-full px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-medium rounded-lg transition-colors flex items-center justify-center gap-2 disabled:opacity-50 cursor-pointer"
+                >
+                  <Send className="w-3.5 h-3.5" />
+                  <span>{isSendingTest ? 'Dispatching Test Email...' : 'Send Test OTP Email Now'}</span>
+                </button>
+              </form>
+
+              {testResult && (
+                <div className="p-3 bg-slate-900 border border-slate-800 rounded-lg text-xs font-mono text-slate-300">
+                  {testResult}
+                </div>
+              )}
+            </div>
           </div>
 
           <div className="pt-4 border-t border-slate-800/80 text-[11px] text-slate-400 flex items-center gap-2">
             <ShieldCheck className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
             <span>
-              Codes expire automatically after 10 minutes and can only be used once.
+              Official email OTPs are dispatched with priority and arrive in member inboxes within seconds.
             </span>
           </div>
         </div>

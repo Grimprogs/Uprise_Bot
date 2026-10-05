@@ -7,6 +7,10 @@ import readyEvent from '../events/ready.ts';
 import guildMemberAddEvent from '../events/guildMemberAdd.ts';
 import guildMemberRemoveEvent from '../events/guildMemberRemove.ts';
 import interactionCreateEvent from '../events/interactionCreate.ts';
+import voiceStateUpdateEvent from '../events/voiceStateUpdate.ts';
+import VoiceChannelService from '../services/voiceChannelService.ts';
+import EventChannelService from '../services/eventChannelService.ts';
+import VoiceScheduler from '../services/voiceScheduler.ts';
 
 import verifyCommand from '../commands/verify.ts';
 import xpCommand from '../commands/xp.ts';
@@ -14,6 +18,9 @@ import leaderboardCommand from '../commands/leaderboard.ts';
 import referralsCommand from '../commands/referrals.ts';
 import adminXpCommand from '../commands/adminXp.ts';
 import adminReferralCommand from '../commands/adminReferral.ts';
+import vcCommand from '../commands/vc.ts';
+import eventVcCommand from '../commands/eventVc.ts';
+import clearCommand from '../commands/clear.ts';
 
 export const allCommands = [
   verifyCommand,
@@ -22,6 +29,9 @@ export const allCommands = [
   referralsCommand,
   adminXpCommand,
   adminReferralCommand,
+  vcCommand,
+  eventVcCommand,
+  clearCommand,
 ];
 
 let botClient: Client | null = null;
@@ -92,8 +102,15 @@ export async function startDiscordBot(): Promise<Client> {
         GatewayIntentBits.GuildMembers, // Privileged intent: must be enabled in Discord Dev Portal
         GatewayIntentBits.GuildInvites, // Needed for tracking invites
         GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.GuildVoiceStates, // Join-to-Create hub + empty-channel cleanup
       ],
       partials: [Partials.GuildMember, Partials.User],
+      rest: {
+        // Channel renames are capped at 2 per 10 min. By default discord.js silently queues the
+        // request for up to 10 minutes; reject instead so /vc rename can tell the user when to retry.
+        rejectOnRateLimit: (data) =>
+          data.method === 'PATCH' && data.route === '/channels/:id' && Math.max(data.retryAfter, data.timeToReset) > 5000,
+      },
     });
 
     Logger.setDiscordClient(client);
@@ -110,6 +127,15 @@ export async function startDiscordBot(): Promise<Client> {
     client.on(Events.GuildMemberAdd, (member) => guildMemberAddEvent.execute(member));
     client.on(Events.GuildMemberRemove, (member) => guildMemberRemoveEvent.execute(member));
     client.on(Events.InteractionCreate, (interaction) => interactionCreateEvent.execute(interaction));
+    client.on(Events.VoiceStateUpdate, (oldState, newState) => voiceStateUpdateEvent.execute(oldState, newState));
+    client.on(Events.ChannelDelete, async (channel) => {
+      try {
+        await VoiceChannelService.onChannelDeleted(channel.id);
+        await EventChannelService.onChannelDeleted(channel.id);
+      } catch (err: any) {
+        console.warn('[UPRISE Bot] channelDelete cleanup error:', err.message);
+      }
+    });
 
     client.on('error', (err) => {
       console.error('[UPRISE Bot] Discord client error:', err);
@@ -154,6 +180,7 @@ export function getDiscordBotClient(): Client | null {
  * Gracefully stops the Discord bot
  */
 export async function stopDiscordBot(): Promise<void> {
+  VoiceScheduler.stop();
   if (botClient) {
     console.log('[UPRISE Bot] Destroying Discord client connection...');
     await botClient.destroy();

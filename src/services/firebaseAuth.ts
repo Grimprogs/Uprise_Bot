@@ -21,8 +21,11 @@ provider.setCustomParameters({
   access_type: 'offline',
 });
 
+const STORAGE_KEY = 'google_workspace_access_token';
+
 let isSigningIn = false;
-let cachedAccessToken: string | null = null;
+let cachedAccessToken: string | null =
+  typeof window !== 'undefined' ? localStorage.getItem(STORAGE_KEY) : null;
 
 export const initAuth = (
   onAuthSuccess?: (user: User, token: string) => void,
@@ -30,14 +33,35 @@ export const initAuth = (
 ) => {
   return onAuthStateChanged(auth, async (user: User | null) => {
     if (user) {
-      if (cachedAccessToken) {
-        if (onAuthSuccess) onAuthSuccess(user, cachedAccessToken);
-      } else if (!isSigningIn) {
-        // Token will be populated upon sign-in with popup
-        if (onAuthFailure) onAuthFailure();
+      // 1. Try in-memory cached token or localStorage
+      if (!cachedAccessToken && typeof window !== 'undefined') {
+        cachedAccessToken = localStorage.getItem(STORAGE_KEY);
+      }
+
+      // 2. If still missing, attempt restoring from backend SQLite system settings
+      if (!cachedAccessToken) {
+        try {
+          const res = await fetch('/api/settings');
+          const data = await res.json();
+          if (data?.google_access_token) {
+            cachedAccessToken = data.google_access_token;
+            if (typeof window !== 'undefined') {
+              localStorage.setItem(STORAGE_KEY, cachedAccessToken!);
+            }
+          }
+        } catch {
+          // ignore
+        }
+      }
+
+      if (onAuthSuccess) {
+        onAuthSuccess(user, cachedAccessToken || '');
       }
     } else {
       cachedAccessToken = null;
+      if (typeof window !== 'undefined') {
+        localStorage.removeItem(STORAGE_KEY);
+      }
       if (onAuthFailure) onAuthFailure();
     }
   });
@@ -53,6 +77,21 @@ export const googleSignIn = async (): Promise<{ user: User; accessToken: string 
     }
 
     cachedAccessToken = credential.accessToken;
+    if (typeof window !== 'undefined') {
+      localStorage.setItem(STORAGE_KEY, cachedAccessToken);
+    }
+
+    // Persist permanently in backend database so Discord bot can send Gmail OTPs
+    try {
+      await fetch('/api/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ key: 'google_access_token', value: cachedAccessToken }),
+      });
+    } catch (e) {
+      console.warn('[Auth] Failed to sync token to backend settings:', e);
+    }
+
     return { user: result.user, accessToken: cachedAccessToken };
   } catch (error: any) {
     console.error('Google sign in error:', error);
@@ -63,14 +102,33 @@ export const googleSignIn = async (): Promise<{ user: User; accessToken: string 
 };
 
 export const getAccessToken = async (): Promise<string | null> => {
+  if (!cachedAccessToken && typeof window !== 'undefined') {
+    cachedAccessToken = localStorage.getItem(STORAGE_KEY);
+  }
   return cachedAccessToken;
 };
 
 export const setCachedAccessToken = (token: string | null) => {
   cachedAccessToken = token;
+  if (typeof window !== 'undefined') {
+    if (token) localStorage.setItem(STORAGE_KEY, token);
+    else localStorage.removeItem(STORAGE_KEY);
+  }
 };
 
 export const googleLogout = async () => {
   await signOut(auth);
   cachedAccessToken = null;
+  if (typeof window !== 'undefined') {
+    localStorage.removeItem(STORAGE_KEY);
+  }
+  try {
+    await fetch('/api/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: 'google_access_token', value: '' }),
+    });
+  } catch {
+    // ignore
+  }
 };

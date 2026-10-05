@@ -3,6 +3,7 @@ import Navbar, { TabType } from './components/Navbar.tsx';
 import MembersView from './components/MembersView.tsx';
 import ReferralsView from './components/ReferralsView.tsx';
 import InvitesView from './components/InvitesView.tsx';
+import EventsView from './components/EventsView.tsx';
 import GoogleSheetsHub from './components/GoogleSheetsHub.tsx';
 import CommandsGuideView from './components/CommandsGuideView.tsx';
 import LeaderboardView from './components/LeaderboardView.tsx';
@@ -16,6 +17,7 @@ export function App() {
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [realtimeConnected, setRealtimeConnected] = useState(false);
   const [settings, setSettings] = useState<Record<string, string>>({});
+  const [isBotToggling, setIsBotToggling] = useState(false);
 
   const fetchStatus = useCallback(async () => {
     setIsRefreshing(true);
@@ -34,6 +36,19 @@ export function App() {
       setIsRefreshing(false);
     }
   }, []);
+
+  const handleToggleBot = async () => {
+    setIsBotToggling(true);
+    try {
+      const endpoint = statusData?.botDisabled ? '/api/bot/start' : '/api/bot/stop';
+      await fetch(endpoint, { method: 'POST' });
+      await fetchStatus();
+    } catch (err) {
+      console.error('Failed to toggle bot:', err);
+    } finally {
+      setIsBotToggling(false);
+    }
+  };
 
   // Initial load
   useEffect(() => {
@@ -99,10 +114,33 @@ export function App() {
         activeTab={activeTab}
         setActiveTab={setActiveTab}
         botOnline={statusData?.botOnline || false}
+        botDisabled={Boolean(statusData?.botDisabled)}
+        onToggleBot={handleToggleBot}
         onRefresh={fetchStatus}
-        isRefreshing={isRefreshing}
+        isRefreshing={isRefreshing || isBotToggling}
         realtimeConnected={realtimeConnected}
       />
+
+      {/* PC Hosting Notice Banner */}
+      {statusData?.botDisabled && (
+        <aside aria-label="Bot Gateway Notice" className="bg-amber-950/40 border-b border-amber-800/60 px-4 lg:px-8 py-2 text-xs text-amber-200">
+          <div className="max-w-7xl mx-auto flex flex-wrap items-center justify-between gap-3">
+            <div className="flex items-center gap-2">
+              <span className="w-2 h-2 rounded-full bg-amber-400" />
+              <span>
+                <strong>Cloud Bot Gateway Stopped:</strong> The bot is offline on this cloud server so your friend can run it on their PC without Discord token conflicts.
+              </span>
+            </div>
+            <button
+              onClick={handleToggleBot}
+              disabled={isBotToggling}
+              className="px-2.5 py-1 bg-amber-500 hover:bg-amber-400 text-slate-950 rounded font-semibold text-xs transition-colors cursor-pointer"
+            >
+              Resume Cloud Bot
+            </button>
+          </div>
+        </aside>
+      )}
 
       {/* Real-time Telemetry & Data Storage Bar */}
       <section className="border-b border-slate-800/80 bg-[#0e121b] px-4 lg:px-8 py-2.5">
@@ -180,6 +218,8 @@ export function App() {
         )}
 
         {activeTab === 'referrals' && <ReferralsView onRefreshAll={fetchStatus} />}
+
+        {activeTab === 'events' && <EventsView />}
 
         {activeTab === 'invites' && <InvitesView onRefreshAll={fetchStatus} />}
 
